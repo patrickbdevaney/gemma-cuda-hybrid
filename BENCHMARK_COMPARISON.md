@@ -44,3 +44,10 @@ KEY re-read: reaching the 157 ceiling requires porting/building Marlin-class ver
 ## shared round-trip, dequant pass) - needs cp.async pipeline + occupancy + raw-mma in-register dequant to reach
 ## the 2-4x Marlin promises. STACK to 157: (1) finish Marlin dense GEMM (~+10%), (2) Marlin MoE 29% (~+15%),
 ## (3) FlashInfer attn 8% (~+4%). lmhead+draft (31%) are the hard tail. Multi-session grind, in progress.
+
+## SoL PROFILE + MARLIN/LATENCY BUILD (2026-07-01) — progression to 93.1
+SoL: ALL big verify kernels LATENCY-bound at M=15 (not bandwidth-saturated): lmhead ~55%mem/33%comp,
+MoE gateup 28%mem/52%comp, down 26%mem/49%comp. => prefetch (raise MLP) is the general win.
+ 85.65 -> dense TC raw-mma (+3.3%) -> 88.65 -> MoE gateup U4 prefetch (+1.2%) -> 89.7 -> MoE down U4 prefetch (+3.7%) -> 93.1
+All bit-exact, gate PASS, tau 13.33 held. step 157->143ms (vLLM 85ms, ceiling 157 tok/s).
+Remaining latency-bound levers: draft linears (no prefetch), lmhead MLP, dense-TC cp.async, FlashInfer attn.
