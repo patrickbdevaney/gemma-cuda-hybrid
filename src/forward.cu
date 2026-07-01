@@ -94,25 +94,36 @@ __global__ void k_store_kv(uint16_t* cache, const float* src, int m, int nkv, in
 }
 // single-query-block attention over a BF16 KV cache. query i (abs pos base+i) attends keys [lo, base+i].
 // out[m,nh,hd], Q[m,nh,hd] fp32; Kc/Vc[CAP,nkv,hd] bf16. window=0 => full causal.
+// HEAD-PACKED: one block per (query i, kv_head kvh) processes ALL G=nh/nkv sibling query heads; KV read ONCE
+// (was 4x redundant per query-head). Batched reduction over the G heads keeps syncs low.
 __global__ void sdpa_cache_kernel(float* out, const float* Q, const uint16_t* Kc, const uint16_t* Vc,
                                   int m, int nkv, int nh, int hd, int window, float scaling){
-    int i=blockIdx.x, h=blockIdx.y; if(i>=m||h>=nh) return;
-    int p=g_base+i, kvh=h/(nh/nkv); int lo=(window>0)?max(0,p-window+1):0;
-    extern __shared__ float sh[]; float* Qs=sh; float* acc=sh+hd; float* red=sh+2*hd;
-    int d=threadIdx.x;
-    Qs[d]=Q[((size_t)i*nh+h)*hd+d]; acc[d]=0.f; __syncthreads();
-    float m_run=-1e30f, l_run=0.f;
+    int i=blockIdx.x, kvh=blockIdx.y; if(i>=m||kvh>=nkv) return;
+    int G=nh/nkv, p=g_base+i, lo=(window>0)?max(0,p-window+1):0, d=threadIdx.x;
+    extern __shared__ float red[];   // [G*hd] only; Qs/acc in registers -> shmem small even for hd=512,G=8
+    __shared__ float mr[16],lr[16],cb[16],pb[16];
+    float qs[8], acc[8];
+    #pragma unroll
+    for(int g=0;g<8;++g){ if(g<G){ int h=kvh*G+g; qs[g]=Q[((size_t)i*nh+h)*hd+d]; } acc[g]=0.f; }
+    if(d<G){ mr[d]=-1e30f; lr[d]=0.f; }
+    __syncthreads();
     for(int j=lo;j<=p;++j){
-        unsigned uk=(unsigned)Kc[((size_t)j*nkv+kvh)*hd+d]<<16; float kf; memcpy(&kf,&uk,4);
-        red[d]=Qs[d]*kf; __syncthreads();
-        for(int s=hd/2;s>0;s>>=1){ if(d<s)red[d]+=red[d+s]; __syncthreads(); }
-        float score=red[0]*scaling;
-        float nm=fmaxf(m_run,score), corr=__expf(m_run-nm), pj=__expf(score-nm);
-        l_run=l_run*corr+pj;
+        unsigned uk=(unsigned)Kc[((size_t)j*nkv+kvh)*hd+d]<<16; float kf; memcpy(&kf,&uk,4);   // KV read ONCE for all G heads
         unsigned uv=(unsigned)Vc[((size_t)j*nkv+kvh)*hd+d]<<16; float vf; memcpy(&vf,&uv,4);
-        acc[d]=acc[d]*corr+pj*vf; m_run=nm; __syncthreads();
+        #pragma unroll
+        for(int g=0;g<8;++g) if(g<G) red[g*hd+d]=qs[g]*kf;
+        __syncthreads();
+        for(int s=hd/2;s>0;s>>=1){ if(d<s){
+            #pragma unroll
+            for(int g=0;g<8;++g) if(g<G) red[g*hd+d]+=red[g*hd+d+s]; } __syncthreads(); }
+        if(d<G){ int g=d; float score=red[g*hd]*scaling; float nm=fmaxf(mr[g],score);
+            cb[g]=__expf(mr[g]-nm); pb[g]=__expf(score-nm); lr[g]=lr[g]*cb[g]+pb[g]; mr[g]=nm; }
+        __syncthreads();
+        #pragma unroll
+        for(int g=0;g<8;++g) if(g<G) acc[g]=acc[g]*cb[g]+pb[g]*vf;
     }
-    out[((size_t)i*nh+h)*hd+d]=acc[d]/l_run;
+    #pragma unroll
+    for(int g=0;g<8;++g) if(g<G){ int h=kvh*G+g; out[((size_t)i*nh+h)*hd+d]=acc[g]/lr[g]; }
 }
 
 // batched lm_head over mtok positions: logits[mtok,V]; each block loads one embed row, reused across positions
@@ -555,7 +566,7 @@ static void attention_cached(Model& m, Session& S, float* h, int mtok, int base,
     rope_rotate_half(k, dc, ds, mtok, nkv,   hd, hd, 0);
     k_store_kv<<<(mtok*kd+255)/256,256>>>(S.Kc[L], k, mtok, nkv, hd);   // reads g_base
     k_store_kv<<<(mtok*kd+255)/256,256>>>(S.Vc[L], v, mtok, nkv, hd);
-    int shmem=(2*hd+ (hd>256?hd:256))*4; dim3 grid(mtok,NHEAD);
+    int G=NHEAD/nkv; int shmem=G*hd*4; dim3 grid(mtok,nkv);   // head-packed: one block per (query, kv_head)
     sdpa_cache_kernel<<<grid,hd,shmem>>>(ao, q, S.Kc[L], S.Vc[L], mtok, nkv, NHEAD, hd, is_full(L)?0:SWIN, 1.0f);   // reads g_base
     if(MEGA && mtok==1 && !W4A4_TAPS){   // M2: fused o_proj + post_attn_norm + residual
         std::string o_=P+"self_attn.o_proj";
