@@ -31,3 +31,16 @@ hand-tuned CUDA-core needs a MARLIN-CLASS kernel (cp.async double-buffer pipelin
 occupancy tuning, offline weight repack) — a major expert build (Marlin is a years-tuned research artifact), NOT
 a naive wmma. Kept flag-gated (TCVERIFY, off) as the correct foundation for that build. Champion 85 held.
 KEY re-read: reaching the 157 ceiling requires porting/building Marlin-class verify kernels. Naive TC is slower.
+
+## STEADY-STATE PROFILE (TCVERIFY on) — the real component map to attack (2026-07-01)
+ lmhead w4a16      19.9%  (bandwidth-bound, TC neutral - hard)
+ dense verify TC   19.1%  (tc_w4a16 - BIG; my TC only ~4% faster than CUDA-core, 160us vs ~21us BW floor -> overhead/occupancy bound, huge headroom)
+ MoE gateup grouped16.3%
+ MoE down_bw       12.9%  (MoE total 29% - next big lever)
+ draft k_linear    10.9%  (bf16 draft)
+ sdpa verify attn   7.9%  (FlashInfer-style head-packing lever)
+ rmsnorm 1.6%, draft attn 1.3%, prefill 5%
+## Marlin build step 1 (coalesced uint load): dense TC +2.2% net. TC is overhead-bound (~8 warp/SM occupancy,
+## shared round-trip, dequant pass) - needs cp.async pipeline + occupancy + raw-mma in-register dequant to reach
+## the 2-4x Marlin promises. STACK to 157: (1) finish Marlin dense GEMM (~+10%), (2) Marlin MoE 29% (~+15%),
+## (3) FlashInfer attn 8% (~+4%). lmhead+draft (31%) are the hard tail. Multi-session grind, in progress.
