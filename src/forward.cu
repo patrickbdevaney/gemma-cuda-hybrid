@@ -464,6 +464,7 @@ struct Session {
 // W4A4 Linear: out_row[M,N] = (in_row[M,K] @ W[N,K]^T) using stored global scales. Pads M>=128.
 // Unified W4A16 Linear (FP4 weight x fp32 activation): out_row[M,N] = dequant(W[N,K]) @ in_row[M,K]^T.
 // Same precision for ALL M (decode, prefill, verify) -> self-consistent + accurate (matches vLLM on ties).
+extern "C" void tc_w4a16_gemm(float* out, const uint8_t* wp, const uint8_t* ws, float w_gscale, const void* x16, int M, int N, int K, cudaStream_t s);
 static void linear(Model& m, float* out_row, const float* in_row, const std::string& prefix, int M, int N, int K){
     uint8_t* Wp = m.dptr<uint8_t*>(prefix+".weight_packed");
     uint8_t* Ws = m.dptr<uint8_t*>(prefix+".weight_scale");
@@ -481,7 +482,9 @@ static void linear(Model& m, float* out_row, const float* in_row, const std::str
         __half* x16; bool bigx = M>MAXM;
         if(bigx) CU(cudaMalloc(&x16,(size_t)M*K*sizeof(__half))); else x16=DS->xh16;
         k_f32_to_f16<<<((size_t)M*K+255)/256,256>>>(x16, xin, (size_t)M*K);
-        w4a16_gemm(out_row, Wp, Ws, wg, x16, M, N, K, 0);
+        static bool TCV = getenv("TCVERIFY")!=nullptr;
+        if(TCV && M<=16 && N<=8192) tc_w4a16_gemm(out_row, Wp, Ws, wg, x16, M, N, K, 0);   // lever A: TC verify GEMM (dense only; lm_head N=VOCAB stays CUDA-core/bandwidth-bound)
+        else w4a16_gemm(out_row, Wp, Ws, wg, x16, M, N, K, 0);
         if(bigx){ CU(cudaStreamSynchronize(0)); CU(cudaFree(x16)); }
     }
     if(aq_big){ CU(cudaStreamSynchronize(0)); CU(cudaFree(aq_big)); }

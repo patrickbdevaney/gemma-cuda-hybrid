@@ -22,3 +22,12 @@ Ranked by our profiled share + research (vLLM/SGLang steal-list):
  D. Ragged-Q / head-packed verify attention (FlashInfer-style; one varlen launch, KV-bandwidth-bound).
  E. (later) FP8 KV cache.
 Target: 157ms -> ~85ms step -> ~130-157 tok/s (past vLLM's 107).
+
+## LEVER A ATTEMPT (TC verify GEMM) — MEASURED, honest result (2026-07-01)
+Built wmma W4A16 verify GEMM (FP4->fp16 dequant->shared, fp32 accum). VERIFIED BIT-EXACT (tau 13.33 preserved).
+Speed: 16K-tile -5%, dense-only -5.5%, 64K-tile -25% (occupancy). => naive wmma CANNOT beat the tuned CUDA-core
+w4a16 at M=15 on Thor. The verify IS compute-bound (would benefit from a GOOD TC kernel), but beating the
+hand-tuned CUDA-core needs a MARLIN-CLASS kernel (cp.async double-buffer pipeline, coalesced tiled weight load,
+occupancy tuning, offline weight repack) — a major expert build (Marlin is a years-tuned research artifact), NOT
+a naive wmma. Kept flag-gated (TCVERIFY, off) as the correct foundation for that build. Champion 85 held.
+KEY re-read: reaching the 157 ceiling requires porting/building Marlin-class verify kernels. Naive TC is slower.
