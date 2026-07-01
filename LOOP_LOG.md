@@ -1,0 +1,10 @@
+# Autonomous zenith loop — base decode + draft (2026-07-01), targeting >100 tok/s
+Baseline: base 44 tok/s (~29% of ~152 roofline), DFlash 84.3. Champion metric per mode; correctness gate MUST pass.
+## Levers already closed (see RESEARCH_SYNTHESIS.md): TC (wrong hammer), full-graph (7%), draft->FP4 (hurts accept),
+## MoE grouped (padding). Base-decode M=1 MoE is latency/compute-bound at 13.6% BW = the biggest headroom (3.2x).
+## Research running: M=1 FP4 MoE zenith kernel (hit the HBM floor).
+
+## iter1: fp4_gemv M=1 K-unroll prefetch U=4 -> LOST (44.5->43.9). Single-accumulator GEMV is register-sensitive;
+## large-N (qkv N=4096, lmhead N=262144) already has enough warps for MLP -> prefetch just adds regs. Reverted.
+## Base decode profile: fp4_gemv(dense+lmhead) 32.7%, MoE gateup 19.3%+down 12% =31%, rmsnorm 9% (launch-inflated,
+## hidden in graph). Await M=1-GEMV-zenith research for the specific floor-hitting technique.
