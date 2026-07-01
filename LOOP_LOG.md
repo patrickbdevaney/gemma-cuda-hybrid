@@ -91,3 +91,16 @@ Baseline: base 44 tok/s (~29% of ~152 roofline), DFlash 84.3. Champion metric pe
 ## VALIDATES the megakernel approach: fusion overhead fully amortizes when grid is sized right. => each additional
 ## fused op (M2+) should push POSITIVE (savings accumulate, no coordination penalty). Was -2% purely from block-count
 ## under-provisioning, NOT fundamental. Trajectory is GO. Champion (flag off) 44.9 held.
+
+## === MEGAKERNEL VIABILITY — measured finding (from building M1) ===
+## Two fusion classes, measured:
+##  (1) PRODUCER->CONSUMER (M1: block0 does rmsnorm-reduction -> many consumers do QKV): consumers need NO barrier
+##      among themselves -> can launch ANY block count (768) -> full concurrency -> BREAK-EVEN. VIABLE.
+##  (2) GRID-BARRIER (o_proj+post_norm+residual, MoE gateup->down: all-produce-THEN-reduce/consume): needs a grid-wide
+##      arrival barrier -> all blocks must be RESIDENT -> capped at ~40 blocks -> the -2% concurrency penalty measured
+##      at 64 blocks (vs 768 break-even). These fusions LOSE the GEMV concurrency they'd need to win.
+## Most useful fusions (attention tail, MoE) are class (2). => the FULL-step megakernel for THIS M=1 + already-GRAPHED
+## base is likely MARGINAL (~1.0-1.15x), NOT 1.5-2x: grid-barrier concurrency penalties offset the fusion savings,
+## and the launch-overhead win is already captured by the graph. Aligns with research (MPK MoE = only 1.16x). A
+## multi-week full build would plausibly reach base ~48-52 / DFlash ~90-98 - close to but NOT clearly past 100, and
+## NOT the base 3x that >100-on-base would need. M1 (break-even, bit-exact, flag-gated) stands as the proven foundation.
