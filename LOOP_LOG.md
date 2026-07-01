@@ -51,3 +51,13 @@ Baseline: base 44 tok/s (~29% of ~152 roofline), DFlash 84.3. Champion metric pe
 ## => CLOSED: base micro-tuning (exhausted), draft quant (FP4+FP8 both lost). Remaining = RESTRUCTURES only:
 ##   cp.async base GEMV (lever B, uncertain per hackathon) | megakernel (huge) | fused-MoE (graphed=minimal).
 ## Champion HELD: base 44.6 / DFlash 84.7. The draft's bf16 + high tau 13.3 IS the moat - don't touch it.
+
+## iter6: lever B cp.async double-buffer gateup (depth-4, weight stream off-registers via SMEM). -> LOST -5% (44.6->42.4).
+## Gate PASS (correct) but slower: SMEM round-trip + __pipeline commit/wait/syncwarp overhead > the register-freeing
+## gain, because per-pass compute (8 FP4 decode + FMA) is too small to hide the staging latency. CONFIRMS the
+## hackathon finding (cp.async loses vs direct streaming here). Reverted. Deeper D just adds SMEM/cuts occupancy.
+## === DEFINITIVE: ALL tractable kernel levers now CLOSED by measurement (7 iters). base 44.6 / DFlash 85 is the
+## practical limit of the current per-kernel warp-per-output architecture. The ONLY remaining lever to the ~137
+## roofline is the MEGAKERNEL (persistent single-kernel, on-GPU instruction interpreter, counter-sync, fused
+## norm+GEMM per Hazy) - a multi-SESSION engineering build, not a loop iteration. Documented as the next major
+## undertaking. The bf16 draft (tau 13.3) + FP4 lm_head remain the moat that makes DFlash 85 competitive.
