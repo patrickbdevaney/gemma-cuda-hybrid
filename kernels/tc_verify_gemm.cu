@@ -48,7 +48,7 @@ __global__ void tc_w4a16_kernel(float* out, const uint8_t* wpr, const uint8_t* w
     const __half* xg0 = x16 + (size_t)gid*K;
     const __half* xg8 = x16 + (size_t)(gid+8)*K;
     bool m0=gid<M, m8=(gid+8)<M;
-    const int U=4;   // software-pipelined weight prefetch: U coalesced loads before decode/mma -> more bytes-in-flight (60%->higher BW)
+    const int U=8;   // software-pipelined weight prefetch: U coalesced loads before decode/mma -> more bytes-in-flight (60%->higher BW)
     for(int kb=0; kb<kt; kb+=U){
         unsigned short w2[U];
         #pragma unroll
