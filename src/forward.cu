@@ -278,16 +278,22 @@ __global__ void k_moe_gateup_grouped(__half* hbuf,const __half* x2,const int* ec
     for(int base=0;base<cnt;base+=4){ int nb=cnt-base; if(nb>4)nb=4;
         float ag[4]={0,0,0,0},au[4]={0,0,0,0}; const __half* xp[4];
         for(int c=0;c<nb;++c){ xp[c]=x2+(size_t)(elist[e*EL+base+c]/8)*H; }
-        for(int vi=lane;vi<nu;vi+=32){ int k=vi*8;
-            unsigned wg=__ldcs(&gpw[vi]); float sg=hw_e4m3(__ldcs(&gsw[k>>4]))*ginv; unsigned wu=__ldcs(&upw[vi]); float su=hw_e4m3(__ldcs(&usw[k>>4]))*uinv;
-            const unsigned char* wgb=(const unsigned char*)&wg; const unsigned char* wub=(const unsigned char*)&wu;
-            __half2 gd0=dec_fp4x2(wgb[0]),gd1=dec_fp4x2(wgb[1]),gd2=dec_fp4x2(wgb[2]),gd3=dec_fp4x2(wgb[3]);
-            __half2 ud0=dec_fp4x2(wub[0]),ud1=dec_fp4x2(wub[1]),ud2=dec_fp4x2(wub[2]),ud3=dec_fp4x2(wub[3]);
-            for(int c=0;c<nb;++c){ uint4 xpk=*(const uint4*)(xp[c]+k); const __half2* x=(const __half2*)&xpk;
-                __half2 g2=__hadd2(__hadd2(__hmul2(gd0,x[0]),__hmul2(gd1,x[1])),__hadd2(__hmul2(gd2,x[2]),__hmul2(gd3,x[3])));
-                __half2 u2=__hadd2(__hadd2(__hmul2(ud0,x[0]),__hmul2(ud1,x[1])),__hadd2(__hmul2(ud2,x[2]),__hmul2(ud3,x[3])));
-                ag[c]+=sg*(__half2float(__low2half(g2))+__half2float(__high2half(g2)));
-                au[c]+=su*(__half2float(__low2half(u2))+__half2float(__high2half(u2))); } }
+        const int U=4;   // K-unroll prefetch: issue U gate+up weight loads before decode/FMA -> raise MLP (SoL: latency-bound)
+        for(int vi=lane;vi<nu;vi+=32*U){
+            unsigned wg[U],wu[U]; int vv[U];
+            #pragma unroll
+            for(int u=0;u<U;++u){ int v=vi+u*32; vv[u]=v; if(v<nu){ wg[u]=__ldcs(&gpw[v]); wu[u]=__ldcs(&upw[v]); } }
+            #pragma unroll
+            for(int u=0;u<U;++u){ int v=vv[u]; if(v>=nu) continue; int k=v*8;
+                float sg=hw_e4m3(__ldcs(&gsw[k>>4]))*ginv, su=hw_e4m3(__ldcs(&usw[k>>4]))*uinv;
+                const unsigned char* wgb=(const unsigned char*)&wg[u]; const unsigned char* wub=(const unsigned char*)&wu[u];
+                __half2 gd0=dec_fp4x2(wgb[0]),gd1=dec_fp4x2(wgb[1]),gd2=dec_fp4x2(wgb[2]),gd3=dec_fp4x2(wgb[3]);
+                __half2 ud0=dec_fp4x2(wub[0]),ud1=dec_fp4x2(wub[1]),ud2=dec_fp4x2(wub[2]),ud3=dec_fp4x2(wub[3]);
+                for(int c=0;c<nb;++c){ uint4 xpk=*(const uint4*)(xp[c]+k); const __half2* x=(const __half2*)&xpk;
+                    __half2 g2=__hadd2(__hadd2(__hmul2(gd0,x[0]),__hmul2(gd1,x[1])),__hadd2(__hmul2(gd2,x[2]),__hmul2(gd3,x[3])));
+                    __half2 u2=__hadd2(__hadd2(__hmul2(ud0,x[0]),__hmul2(ud1,x[1])),__hadd2(__hmul2(ud2,x[2]),__hmul2(ud3,x[3])));
+                    ag[c]+=sg*(__half2float(__low2half(g2))+__half2float(__high2half(g2)));
+                    au[c]+=su*(__half2float(__low2half(u2))+__half2float(__high2half(u2))); } } }
         for(int c=0;c<nb;++c){
             #pragma unroll
             for(int o=16;o>0;o>>=1){ ag[c]+=__shfl_down_sync(0xffffffffu,ag[c],o); au[c]+=__shfl_down_sync(0xffffffffu,au[c],o); }
