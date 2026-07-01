@@ -61,3 +61,17 @@ Baseline: base 44 tok/s (~29% of ~152 roofline), DFlash 84.3. Champion metric pe
 ## roofline is the MEGAKERNEL (persistent single-kernel, on-GPU instruction interpreter, counter-sync, fused
 ## norm+GEMM per Hazy) - a multi-SESSION engineering build, not a loop iteration. Documented as the next major
 ## undertaking. The bf16 draft (tau 13.3) + FP4 lm_head remain the moat that makes DFlash 85 competitive.
+
+## iter7 (megakernel M1 scoping): examined the real attention layer = ~15 sequential kernels (rmsnorm, q/k/v proj,
+## q/k/v norm, rope x2, store_kv x2, sdpa, o_proj, post_norm, add) + the MoE (gateup/down) + more norms. A megakernel
+## must fuse ALL of these into one persistent grid with counter-sync + on-GPU interpreter + FlashNorm-folded norms.
+## HONEST FINDING: M1 (persistent skeleton + counter-sync + input_rmsnorm+QKV fused, correctness-first) is genuinely
+## the FIRST STEP of a multi-WEEK ground-up rewrite with (a) NO speed payoff until ~M4 (all 30 layers fused), (b) high
+## correctness risk per milestone, (c) uncertain ~1.3-1.7x final payoff (MPK over already-fused vLLM; NOT a base 3x),
+## (d) the base is already GRAPHED so the launch-overhead portion of the megakernel win is partly captured already.
+## Building a persistent cooperative kernel safely needs a DEDICATED focused effort, not autonomous loop iterations in
+## a large accumulated context (high risk of a broken half-built state). MEGAKERNEL_PLAN.md documents the M1-M5 path.
+## === LOOP TERMINUS: the tractable optimization space is EXHAUSTIVELY mapped + closed by measurement. Champion held:
+## base 44.9 / DFlash 85. The megakernel is real but a distinct major project. Honest recommendation: dedicated build,
+## explicit go-ahead, not autonomous grinding. The bf16-draft moat (tau 13.3 vs vLLM 7.84) + FP4 lm_head keep DFlash 85
+## genuinely competitive with vLLM's ~100 despite fewer per-kernel opts.
