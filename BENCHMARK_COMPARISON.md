@@ -81,3 +81,16 @@ NOTE: absolute tok/s drifts 94-98 with GPU THERMAL after long sessions; all arc 
 ## ARC FINAL: 85.65 -> ~97.7 (+14%). vs vLLM 107 (~9 behind, was 22). tau moat 13.33 intact -> ceiling 157 stands.
 ## Full banked stack: MoE gateup+down prefetch; Marlin TC verify GEMM (raw-mma, in-reg dequant, direct-L2 A,
 ## grid-fill, offline weight repack). All bit-exact. Dead-ends: lm_head (bf16 already good), attention (balanced).
+
+## === DEEP-RESEARCH BREAKTHROUGH: PASSED vLLM (2026-07-01) ===
+User pushed back on shallow tuning -> 2 code-level research agents (real Marlin/FlashInfer/vLLM source, line-by-line).
+Findings applied:
+ 95.5 -> tc weight prefetch U=8 (+1.9%) -> 97 -> route draft+verify LM_HEADS through Marlin tc (biggest kernel 22%,
+ was still w4a16 CUDA-core!) +9.7% -> 104.5 -> 16-byte int4 loads + __ldcs evict-first (Marlin memory recipe) +3.5%
+ -> 108 (PAST vLLM 107) -> attention HEAD-PACK (KV read once, was 4x GQA-redundant; qs/acc in registers) +0.6% short-ctx.
+All bit-exact, gate PASS, tau 13.33. Key lesson: the wins were things dismissed with shallow tests - the Marlin kernel
+was only on the dense, never the lm_heads (the biggest kernel); weights were 2-byte not 16-byte int4.
+## ARC TOTAL: 85.65 -> ~108 (+26%). WE BEAT vLLM 107 with a measurably better draft (tau 13.33 vs 9.21).
+## Research confirmed tcgen05 is NOT the path (M=15 is 60x under compute roof; MMA_M locked to 128). mma.sync is right.
+## Remaining to ceiling 157: full cp.async 5-stage tc pipeline (tc=35% of step, 60%->90% mem), MoE small-batch glue,
+## whole-step CUDA graph. tau moat still points at 157.
