@@ -71,3 +71,13 @@ at N=VOCAB and don't beat it. lm_head is NOT a tractable win. Reverted to bf16.
 ## Banked: MoE gateup+down prefetch, Marlin TC verify GEMM (raw-mma, in-reg dequant, no-shared, grid-fill WARPS=1).
 ## Exhausted/dead-end: lm_head (bf16 already good), attention (balanced 50-60%/95% occ). Remaining = offline weight
 ## repack for dense-TC coalescing (core Marlin, complex, ~+5%) - the only clear lever left, a major build.
+
+## OFFLINE WEIGHT REPACK (2026-07-01) — the core Marlin technique, DONE
+Repack each dense verify weight ONCE (cached by src ptr) into [n_block][k_tile][lane] order so a warp's per-k-tile
+reads are 64 CONTIGUOUS bytes (coalesced) vs 8 strided row-reads. Lazy repack on warm-up (pre-graph-capture) ->
+graph-safe. Kernel reads unsigned short/lane (coalesced), in-register FP4 dequant, WARPS=1 (grid-fill best).
+RESULT (back-to-back): 96.4 -> 97.9 (+1.6%), bit-exact, gate PASS. tc_w4a16 now memory-bound ~60% (coalesced).
+NOTE: absolute tok/s drifts 94-98 with GPU THERMAL after long sessions; all arc deltas measured back-to-back.
+## ARC FINAL: 85.65 -> ~97.7 (+14%). vs vLLM 107 (~9 behind, was 22). tau moat 13.33 intact -> ceiling 157 stands.
+## Full banked stack: MoE gateup+down prefetch; Marlin TC verify GEMM (raw-mma, in-reg dequant, direct-L2 A,
+## grid-fill, offline weight repack). All bit-exact. Dead-ends: lm_head (bf16 already good), attention (balanced).
