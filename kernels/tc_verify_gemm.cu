@@ -1,8 +1,8 @@
-// tc_verify_gemm.cu — Marlin-class TC W4A16 verify GEMM (lever A) with OFFLINE WEIGHT REPACK.
-// out[M,N] = dequant(W[N,K]) @ x[M,K]^T, FP4 weight x fp16 act, fp32 accum. Raw mma.sync.m16n8k16, 1 warp = 8 N-cols
+// tc_verify_gemm.cu — Marlin-class TC W4A16 verify GEMM (lever A). Raw mma.sync.m16n8k16, 1 warp = 8 N-cols
 // (max grid fill), A fragment direct from L2 global x (no shared/sync), B in-register FP4->fp16 dequant.
-// REPACK: weight/scale rearranged once (cached by src ptr) into [n_block][k_tile][lane] order so a warp's per-k-tile
-// reads are 64 CONTIGUOUS bytes (coalesced) instead of 8 strided row-reads -> pushes the memory-bound kernel higher.
+// REPACK -> 16-BYTE int4 coalesced weight loads (8 k-tiles/load) via __ldcs (evict-first L2, weights read once so
+// they don't thrash the reused activations). Weight laid out [n_block][k_group8][lane*16] -> 512 contiguous B/group.
+// Cached by src ptr, lazy on warm-up (graph-safe).
 #include <cuda_fp16.h>
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
@@ -21,12 +21,12 @@ __device__ __forceinline__ void mma_m16n8k16(float* c, const unsigned* a, const 
       : "+f"(c[0]),"+f"(c[1]),"+f"(c[2]),"+f"(c[3])
       : "r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]), "r"(b[0]),"r"(b[1]));
 }
-// ---- repack: wp[N][K/2] -> wpr[N/8][K/16][64] (lane order [blo,bhi], lane=gid*4+t4); ws[N][K/16] -> wsr[N/8][K/16][8]
+// repack: wp[N][K/2] -> wpr[N/8][K/128][32 lane][16B] (lane's 8 k-tiles x {blo,bhi}); ws[N][K/16] -> wsr[N/8][K/16][8]
 __global__ void k_tc_repack_w(uint8_t* wpr, const uint8_t* wp, int N, int K){
-    long idx=(long)blockIdx.x*blockDim.x+threadIdx.x; int kt=K/16; long tot=(long)(N/8)*kt*32; if(idx>=tot)return;
-    int lane=idx&31; long r=idx>>5; int k_tile=r%kt, n_block=r/kt, gid=lane>>2, t4=lane&3;
-    long src=(long)(n_block*8+gid)*(K/2) + (long)k_tile*8;
-    long dst=((long)n_block*kt + k_tile)*64 + lane*2;
+    long idx=(long)blockIdx.x*blockDim.x+threadIdx.x; int kg8=K/128; long tot=(long)(N/8)*kg8*32*8; if(idx>=tot)return;
+    int kl=idx&7; long r=idx>>3; int lane=r&31; long r2=r>>5; int g=r2%kg8, n_block=r2/kg8, gid=lane>>2, t4=lane&3;
+    int k_tile=g*8+kl; long src=(long)(n_block*8+gid)*(K/2) + (long)k_tile*8;
+    long dst=((long)n_block*kg8 + g)*512 + (long)lane*16 + 2*kl;
     wpr[dst]=wp[src+t4]; wpr[dst+1]=wp[src+t4+4];
 }
 __global__ void k_tc_repack_s(uint8_t* wsr, const uint8_t* ws, int N, int K){
@@ -34,7 +34,6 @@ __global__ void k_tc_repack_s(uint8_t* wsr, const uint8_t* ws, int N, int K){
     int g=idx&7; long r=idx>>3; int k_tile=r%kt, n_block=r/kt;
     wsr[((long)n_block*kt + k_tile)*8 + g] = ws[(long)(n_block*8+g)*(K/16) + k_tile];
 }
-// ---- GEMM over repacked weight (coalesced 64B/warp/k-tile) ----
 #ifndef WARPS
 #define WARPS 1
 #endif
@@ -42,27 +41,25 @@ __global__ void tc_w4a16_kernel(float* out, const uint8_t* wpr, const uint8_t* w
                                 const __half* x16, int M, int N, int K){
     int lane=threadIdx.x&31, gid=lane>>2, t4=lane&3;
     int warp=threadIdx.x>>5; int n_block=blockIdx.x*WARPS+warp; if((long)n_block*8>=N) return; int n0=n_block*8;
-    float c[4]={0.f,0.f,0.f,0.f}; int kt=K/16;
-    const uint8_t* wb = wpr + (long)n_block*kt*64;
+    float c[4]={0.f,0.f,0.f,0.f}; int kg8=K/128, kt=K/16;
+    const uint8_t* wb = wpr + (long)n_block*kg8*512;
     const uint8_t* sb = wsr + (long)n_block*kt*8;
     const __half* xg0 = x16 + (size_t)gid*K;
     const __half* xg8 = x16 + (size_t)(gid+8)*K;
     bool m0=gid<M, m8=(gid+8)<M;
-    const int U=8;   // software-pipelined weight prefetch: U coalesced loads before decode/mma -> more bytes-in-flight (60%->higher BW)
-    for(int kb=0; kb<kt; kb+=U){
-        unsigned short w2[U];
+    for(int g=0; g<kg8; ++g){
+        uint4 w16 = __ldcs((const uint4*)(wb + (long)g*512 + lane*16));   // 16B coalesced, evict-first
+        const uint8_t* wby = (const uint8_t*)&w16;
         #pragma unroll
-        for(int u=0;u<U;++u){ int kt2=kb+u; if(kt2<kt) w2[u]=*(const unsigned short*)(wb + (long)kt2*64 + lane*2); }
-        #pragma unroll
-        for(int u=0;u<U;++u){ int k_tile=kb+u; if(k_tile>=kt) break; int k0=k_tile*16;
+        for(int kl=0; kl<8; ++kl){ int k_tile=g*8+kl, k0=k_tile*16;
             unsigned a[4];
             a[0]=m0? *(const unsigned*)(xg0+k0+2*t4)   : 0u;
             a[1]=m8? *(const unsigned*)(xg8+k0+2*t4)   : 0u;
             a[2]=m0? *(const unsigned*)(xg0+k0+2*t4+8) : 0u;
             a[3]=m8? *(const unsigned*)(xg8+k0+2*t4+8) : 0u;
             __half2 sc2 = __float2half2_rn(tcv_e4m3(sb[(long)k_tile*8 + gid]) * wg_inv);
-            __half2 b0 = __hmul2(tcv_fp4x2((uint8_t)(w2[u]&0xFF)), sc2);
-            __half2 b1 = __hmul2(tcv_fp4x2((uint8_t)(w2[u]>>8)),   sc2);
+            __half2 b0 = __hmul2(tcv_fp4x2(wby[2*kl]),   sc2);
+            __half2 b1 = __hmul2(tcv_fp4x2(wby[2*kl+1]), sc2);
             unsigned bb[2]; bb[0]=*(unsigned*)&b0; bb[1]=*(unsigned*)&b1;
             mma_m16n8k16(c, a, bb);
         }
@@ -73,14 +70,14 @@ __global__ void tc_w4a16_kernel(float* out, const uint8_t* wpr, const uint8_t* w
     if(gid+8<M && n0+cn  <N) out[(size_t)(gid+8)*N + n0+cn ]=c[2];
     if(gid+8<M && n0+cn+1<N) out[(size_t)(gid+8)*N + n0+cn+1]=c[3];
 }
-static std::unordered_map<const void*, std::pair<uint8_t*,uint8_t*>> g_tc_cache;   // repacked weights by src ptr
+static std::unordered_map<const void*, std::pair<uint8_t*,uint8_t*>> g_tc_cache;
 extern "C" void tc_w4a16_gemm(float* out, const uint8_t* wp, const uint8_t* ws, float w_gscale,
                               const void* x16, int M, int N, int K, cudaStream_t s){
     auto it=g_tc_cache.find((const void*)wp); uint8_t *wpr,*wsr;
-    if(it==g_tc_cache.end()){                                    // repack once (first call = warm-up, pre-graph-capture)
-        int kt=K/16; long nb=N/8;
+    if(it==g_tc_cache.end()){
+        long nb=N/8; int kt=K/16;
         cudaMalloc(&wpr,(size_t)nb*kt*64); cudaMalloc(&wsr,(size_t)nb*kt*8);
-        k_tc_repack_w<<<(unsigned)(((long)nb*kt*32+255)/256),256>>>(wpr,wp,N,K);
+        k_tc_repack_w<<<(unsigned)(((long)nb*(K/128)*32*8+255)/256),256>>>(wpr,wp,N,K);
         k_tc_repack_s<<<(unsigned)(((long)nb*kt*8+255)/256),256>>>(wsr,ws,N,K);
         cudaDeviceSynchronize(); g_tc_cache[(const void*)wp]={wpr,wsr};
     } else { wpr=it->second.first; wsr=it->second.second; }
