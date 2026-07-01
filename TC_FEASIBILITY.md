@@ -36,3 +36,15 @@
 - REVISED priority: (1) FULL-STEP CUDA GRAPH (pure CUDA, vLLM's key advantage, no CUTLASS needed) is likely the
   bigger single lever; (2) TC dense GEMMs (+10%, primitive validated & ready in cutlass_moe.cu); (3) TC grouped
   MoE only if per-expert token count rises (not at k=15 verify).
+
+## W4A4 ACCURACY TENSION (2026-07-01) — key integration finding
+- The CUTLASS TC GEMM is FP4xFP4 (W4A4). Validated full pipeline: quantize bf16 -> E2M1+e4m3 -> swizzle -> TC
+  vs fp32 reference = **5.5% rel-L2 error** (the inherent NVFP4 W4A4 error; model is W4A4-native so it's "expected").
+- BUT my server uses W4A16 (FP4 weight x FP16 activation) — LESS error (weight-only). My acceptance edge
+  (tau 13.3 vs vLLM 7.84) may partly derive from this accuracy. Switching verify dense to W4A4 for TC speed
+  risks DROPPING acceptance toward vLLM's -> could negate the ~2x kernel speedup. MUST test acceptance end-to-end.
+- IDEAL alternative (keeps W4A16 accuracy + TC speed): MARLIN-style mixed GEMM = dequant FP4 weight -> bf16 in
+  SMEM, then bf16xbf16 tcgen05 MMA with the bf16 activation. No activation quant error. Need to check if CUTLASS
+  has an FP4-weight x bf16-act mixed-input Blackwell GEMM (ex.55-style mixed dtype), or hand-roll the dequant+MMA.
+  (research agent investigating.) This is the RIGHT target, not naive W4A4.
+- Foundational integration DONE: cutlass_moe.o linked into hybrid server (callable, gate PASS, DFlash 82).

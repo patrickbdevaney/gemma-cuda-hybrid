@@ -147,8 +147,48 @@ int validate_random(int M,int N,int K){
 
 __global__ void fill(uint8_t* p,long n,int v){ long i=blockIdx.x*256L+threadIdx.x; if(i<n)p[i]=(uint8_t)((i*131+v)&0xff); }
 __global__ void bf16_to_f(const uint16_t* b,float* f,int n){int i=blockIdx.x*256+threadIdx.x; if(i<n){unsigned u=(unsigned)b[i]<<16; float x; memcpy(&x,&u,4); f[i]=x;}}
+// ---- REAL quantizer: bf16/fp32 [rows][K] -> E2M1 codes + LINEAR e4m3 group-16 scales + per-tensor global scale ----
+__device__ uint8_t qe2m1(float x){ float a=fabsf(x); uint8_t i;
+    if(a<0.25f)i=0;else if(a<0.75f)i=1;else if(a<1.25f)i=2;else if(a<1.75f)i=3;else if(a<2.5f)i=4;else if(a<3.5f)i=5;else if(a<5.f)i=6;else i=7;
+    return i|((x<0.f)?8:0); }
+__global__ void k_qfp4(uint8_t* codes,uint8_t* scl,const float* in,int rows,int K,float gscale){
+    long idx=(long)blockIdx.x*256+threadIdx.x; int Kg=K/16; if(idx>=(long)rows*Kg)return;
+    int r=idx/Kg,g=idx%Kg; const float* xb=in+(long)r*K+g*16;
+    float amax=0; for(int i=0;i<16;i++)amax=fmaxf(amax,fabsf(xb[i]));
+    float e4r=gscale*(amax/6.f); __nv_fp8_e4m3 e4=__nv_fp8_e4m3(e4r); float e4v=float(e4);
+    float inv=(e4v>0.f)?(gscale/e4v):0.f; scl[idx]=e4.__x;
+    uint8_t* po=codes+(long)r*K/2+g*8;
+    for(int i=0;i<8;i++){ uint8_t lo=qe2m1(xb[2*i]*inv),hi=qe2m1(xb[2*i+1]*inv); po[i]=lo|(hi<<4); }
+}
+__global__ void frnd(float* p,long n,int s){long i=(long)blockIdx.x*256+threadIdx.x; if(i<n){unsigned u=(i*2654435761u+s*40503u); p[i]=((float)(u%2048)/1024.f-1.f)*3.f;}} // ~[-3,3]
+__global__ void refbf(float* D,const float* A,const float* B,int M,int N,int K){int i=blockIdx.x,j=blockIdx.y*256+threadIdx.x; if(i>=M||j>=N)return;float a=0;for(int k=0;k<K;k++)a+=A[(long)i*K+k]*B[(long)j*K+k];D[(long)i*N+j]=a;}
+int validate_w4a4(int M,int N,int K){
+    long asz=(long)M*K,bsz=(long)N*K; float *A,*B,*Dr; cudaMalloc(&A,asz*4);cudaMalloc(&B,bsz*4);cudaMalloc(&Dr,(long)M*N*4);
+    frnd<<<(asz+255)/256,256>>>(A,asz,11);frnd<<<(bsz+255)/256,256>>>(B,bsz,22);cudaDeviceSynchronize();
+    float gs=6.f/3.0f;   // global scale so amax(=3)*... maps into e4m3 range; per-tensor
+    uint8_t *Ac,*Bc,*Al,*Bl,*SFA,*SFB; void* D; void* WS;
+    cudaMalloc(&Ac,asz/2);cudaMalloc(&Bc,bsz/2);cudaMalloc(&Al,asz/16);cudaMalloc(&Bl,bsz/16);
+    cudaMalloc(&SFA,cutlass_sfa_bytes(M,N,K));cudaMalloc(&SFB,cutlass_sfb_bytes(M,N,K));cudaMalloc(&D,(long)M*N*2);
+    long ws=cutlass_workspace_bytes(M,N,K); cudaMalloc(&WS,ws>0?ws:16);
+    cudaMemset(SFA,0,cutlass_sfa_bytes(M,N,K));cudaMemset(SFB,0,cutlass_sfb_bytes(M,N,K));
+    k_qfp4<<<(M*K/16+255)/256,256>>>(Ac,Al,A,M,K,gs); k_qfp4<<<(N*K/16+255)/256,256>>>(Bc,Bl,B,N,K,gs); cudaDeviceSynchronize();
+    cutlass_swizzle_sfa(SFA,Al,M,N,K,0); cutlass_swizzle_sfb(SFB,Bl,M,N,K,0); cudaDeviceSynchronize();
+    float alpha=1.f/(gs*gs);   // dequant: value = code*e4m3/gs  -> D needs /(gsA*gsB)
+    int rc=cutlass_nvfp4_gemm(D,Ac,Bc,SFA,SFB,alpha,M,N,K,WS,0);
+    float* Dw; cudaMalloc(&Dw,(long)M*N*4); bf2ff<<<(M*N+255)/256,256>>>((uint16_t*)D,Dw,M*N);
+    dim3 gb(M,(N+255)/256); refbf<<<gb,256>>>(Dr,A,B,M,N,K); cudaDeviceSynchronize();
+    float *hw=(float*)malloc(M*N*4),*hr=(float*)malloc(M*N*4);
+    cudaMemcpy(hw,Dw,(long)M*N*4,cudaMemcpyDeviceToHost);cudaMemcpy(hr,Dr,(long)M*N*4,cudaMemcpyDeviceToHost);
+    double se=0,sr=0; for(long t=0;t<(long)M*N;t++){double d=hw[t]-hr[t];se+=d*d;sr+=(double)hr[t]*hr[t];}
+    double rmse=sqrt(se/(M*N)), rel=sqrt(se/sr);
+    printf("W4A4 M=%d N=%d K=%d: rc=%d  wrap[0]=%.1f ref[0]=%.1f  RMSE=%.2f rel-L2=%.4f -> %s\n",
+        M,N,K,rc,hw[0],hr[0],rmse,rel,(rc==0&&rel<0.15)?"OK (FP4-quant error)":"CHECK");
+    free(hw);free(hr); return 0;
+}
 int main(int,char**){
-    printf("=== end-to-end validation (random FP4 + swizzle vs fp32 reference) ===\n");
+    printf("=== W4A4 quantize->swizzle->TC vs fp32(bf16 inputs) — measures FP4 quantization error ===\n");
+    validate_w4a4(16,2816,2816); validate_w4a4(16,2816,704); validate_w4a4(128,2816,2816);
+    printf("=== (also raw-FP4 swizzle exactness check) ===\n");
     int r=0;
     r|=validate_random(16,2816,704);    // down shape (per verify-MoE)
     r|=validate_random(16,704,2816);    // gateup shape
