@@ -51,3 +51,13 @@ MoE gateup 28%mem/52%comp, down 26%mem/49%comp. => prefetch (raise MLP) is the g
  85.65 -> dense TC raw-mma (+3.3%) -> 88.65 -> MoE gateup U4 prefetch (+1.2%) -> 89.7 -> MoE down U4 prefetch (+3.7%) -> 93.1
 All bit-exact, gate PASS, tau 13.33 held. step 157->143ms (vLLM 85ms, ceiling 157 tok/s).
 Remaining latency-bound levers: draft linears (no prefetch), lmhead MLP, dense-TC cp.async, FlashInfer attn.
+
+## DENSE-TC GRID-FILL + lm_head (2026-07-01) -> DFlash 96.4
+SoL on tc_w4a16: Memory 22% / Compute 7% -> "grid too small to fill device" (32-64 blocks, occ 27%). NOT cp.async.
+FIX: (1) remove shared A-stage -> read A fragment DIRECT from L2-cached global x (no shared, no syncs);
+(2) WARPS=1 (1 warp/block = max grid fill). 93.6 -> 96.4 (+3%), bit-exact, gate PASS.
+lm_head: TC neutral (memory-bound, TC reads same bytes); 128-bit blocked by non-16B tensor offsets; MLP
+register-limited by acc[15]. Hard nut - left on tuned CUDA-core.
+## ARC TOTAL: 85.65 -> 96.38 (+12.5%). vs vLLM 107 (was 22 behind, now ~11). step 157->~138ms. ceiling 157.
+## Banked levers: dense-TC (Marlin raw-mma, in-reg dequant, no-shared, grid-fill), MoE gateup+down U4 prefetch.
+## Remaining (harder): lm_head fused/FP8, FlashInfer attn (8%), dense-TC toward 2-4x Marlin, MoE split-K.
