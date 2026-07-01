@@ -65,3 +65,18 @@ Megakernel: deferred (1.0-1.7x vs tuned; MoE forces dynamic scheduling; draft+ve
   W4A4 accuracy bar (5.5% GEMM error -> must verify acceptance holds).
 - NEXT: build the CUTLASS GROUPED (kGrouped/MoEProblemShape) TC down + gateup (W4A4), validate acceptance end-to-end.
   This is the substantial build the earlier "TC is wrong" verdict wrongly deferred. bandwidth-down stays (+2.8%, harmless).
+
+## GROUPED-BUILD INVESTIGATION (2026-07-01) — decisive: TC grouped is the WRONG tool, half2 is right
+- ex.92 CUTLASS FP4 grouped GEMM = masked layout BUT **M-tile floor = 128** (no sub-128 for block-scaled FP4).
+  At ~2 tokens/expert each active expert still pads to a 128-row tile = ~64-84x COMPUTE WASTE.
+- For the COMPUTE-bound down: TC grouped ≈ 79 experts x 128-padded x N x K = ~20G MACs → ~625us vs half2 752us
+  = **only ~17%, not 2x**. The 128-tile padding EATS the TC speed at small tokens/expert. Huge build NOT worth it.
+- WHY vLLM's MoE is faster: its Triton fused_moe uses **BLOCK_M=16** (small tile → 8x padding, not 64x). CUTLASS
+  FP4 forces 128. => the right structure for small-batch MoE is a SMALL-TILE kernel with NO 128-padding — which is
+  exactly what my half2 (warp-per-output, processes real tokens) ALREADY IS. My half2 is structurally correct.
+- => The MoE down at 752us is COMPUTE-bound with the right (no-padding) structure. The only remaining lever is
+  OVERLAPPING the FP4 decode with the weight stream (cp.async double-buffer) to hit the ~286us bandwidth floor —
+  but the first research cascade measured cp.async REGRESSING at batch-1. High-uncertainty, likely-marginal.
+- HONEST MoE CONCLUSION: my half2 MoE is near its practical structure limit for ~2 tokens/expert. TC (padding),
+  dedup (compute-bound), grouped (padding) all investigated -> none gives 2x. The MoE is NOT where the win is.
+  Redirect remaining effort AWAY from the MoE to: lmhead BW (60.9%->higher), draft (bf16->FP4?), FP8 KV.
