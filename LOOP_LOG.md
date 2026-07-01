@@ -23,3 +23,15 @@ Baseline: base 44 tok/s (~29% of ~152 roofline), DFlash 84.3. Champion metric pe
 ##  acceptance, halves draft bytes, ~2x draft). 3. Megakernel (draft first, hand-writable; base via MPK). 4. FlashNorm
 ##  fold RMSNorm into GEMM (12-35% norms). 5. Fuse gate+up+SiLU register-intermediate (Cursor warp-decode 1.84x).
 ## Kernel micro-opts near limit (marginal). Next: FP8 draft (real ~2x draft potential) or fuse-gate+up (Cursor).
+
+## LOOP STATE after 3 iters + 2 research streams (2026-07-01): kernel micro-opts NEAR LIMIT (HW-cvt +0.5%,
+## prefetch/draft-FP4/split-K/TC all lost or marginal). The real zenith needs SUBSTANTIAL builds, ranked:
+##  A. FUSED MoE gate+up+SiLU+down one persistent kernel (Cursor warp-decode 1.84x; hbuf in SMEM not DRAM;
+##     one block/layer keeps M=1 work on-chip). Base MoE=31% -> biggest single base lever.
+##  B. cp.async DOUBLE-BUFFER the FP4 weight stream (research #2): moves in-flight bytes OFF registers -> breaks
+##     my U=8/48-reg wall -> gateup 13.6%->~40% BW. The identified path to the M=1 HBM floor.
+##  C. FP8 DRAFT weights (E4M3, not FP4 - keeps acceptance) via a small-N-optimized FP8 k_linear (NOT w4a16);
+##     + the big FC[16896->2816] is bandwidth-bound -> FP8 halves it. Addresses the draft-model target.
+##  D. DRAFT megakernel (5 layers, hand-writable per Hazy 7-instruction model) - the draft zenith.
+##  E. FlashNorm: fold RMSNorm scale into next GEMM + fuse q/k-norm+RoPE (14.7% of layer per TRT-LLM). base norms 9%.
+## Each is a multi-hour build. Champion: base 44.6 / DFlash 84.7. Roofline 137 (89 @65%) -> ~2x base headroom real.
