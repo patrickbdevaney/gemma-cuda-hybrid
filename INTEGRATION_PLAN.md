@@ -43,3 +43,21 @@
 - Thor page-cache: kill vLLM with `docker kill` never `docker stop`. Free RAM: sync + drop_caches.
 - CUTLASS example host guards whitelist sm_100 only -> patch major==11 for any example run.
 - vLLM DFlash uses BF16 KV (rejects fp8 KV, issue #41559) -> fp8 KV is NOT part of the fast path; skip it.
+
+## TC GROUPED MoE (the clarified real lever, 2026-07-01) — scoped from ex.92
+Profile proved the MoE down is COMPUTE-bound (dedup gave ~4%); TC's HW decode+MMA is the right tool.
+Build (substantial, multi-session):
+1. Grouped wrapper: extend cutlass_moe.cu to kGrouped. ProblemShape = MoEProblemShape<Shape<int,int,int>>
+   (device array of per-expert <M,N,K>). Mainloop takes contiguous block_A/B/SFA/SFB (grouped by expert).
+   Disable the block-scale OUTPUT epilogue (we want bf16 out): set IsBlockScaleSupported path off / plain LinComb.
+2. Permutation: gather the ~120 (token,expert) assignments contiguously by expert (we have ecount/elist from
+   k_moe_invert) into a [total, K] activation buffer; per-expert weight ptr = ep->dp[e] (already per-expert).
+3. W4A4 activation quant: quantize the grouped activation (hbuf for down / x2_16 for gateup) to E2M1+e4m3,
+   swizzle SFA (cutlass_swizzle_sfa per group). Weights: swizzle each expert's linear e4m3 scale ONCE at load.
+4. Output = down partials -> reuse k_moe_finalize (already built). gateup similar (-> hbuf).
+5. VALIDATE acceptance end-to-end (W4A4 5.5% GEMM error MUST NOT drop tau 13.3 much) + gate.
+Expected: down 752us -> ~300-500us (single-GEMM was 8us/expert; 79 grouped concurrent). ~+8-12% DFlash if
+acceptance holds. This is the ~2x-MoE lever the "TC is wrong" verdict wrongly deferred (it assumed BW-bound).
+
+## Grind status (this session): bandwidth-down banked (+2.8%, DFlash 84.3); profile clarified MoE is compute-bound
+## -> TC grouped is the next build. Single-GEMM TC wrapper + swizzle already validated (cutlass_moe.cu).
