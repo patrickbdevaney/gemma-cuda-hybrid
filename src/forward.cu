@@ -186,6 +186,8 @@ __global__ void k_fp4_roundtrip(float* x,long n){
 static bool W4A4_TAPS=false;
 __device__ __forceinline__ float e4m3d(uint8_t b){ int s=(b>>7)&1,e=(b>>3)&0xF,man=b&7; float v=(e==0)?(man*0.125f*0.015625f):(ldexpf(1.f+man*0.125f,e-7)); return s?-v:v; }
 __constant__ float C_LUT[256];   // e4m3 byte -> value, computed once (no per-block recompute)
+// HW e4m3 block-scale decode (register-only, no memory op) — replaces the DIVERGENT constant C_LUT lookup
+__device__ __forceinline__ float hw_e4m3(uint8_t b){ __half_raw r=__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)b,__NV_E4M3); return __half2float(*reinterpret_cast<__half*>(&r)); }
 static void init_clut(){ float h[256]; for(int i=0;i<256;++i){ int s=(i>>7)&1,e=(i>>3)&0xF,man=i&7;
     float v=(e==0)?(man*0.125f*0.015625f):((1.f+man*0.125f)*ldexp(1.0,e-7)); h[i]=s?-v:v; }
     CU(cudaMemcpyToSymbol(C_LUT,h,sizeof(h))); }
@@ -247,7 +249,7 @@ __global__ void k_moe_gateup(__half* hbuf,const __half* x2,const int* ids,
         #pragma unroll
         for(int u=0;u<U;++u){ int v=vv[u]; if(v>=nu) continue; int k=v*8;
             uint4 xpk=*(const uint4*)(x+k); const __half2* xh2=(const __half2*)&xpk;   // activation (L2-cached, low latency)
-            float sg=C_LUT[__ldcs(&gsw[k>>4])]*ginv, su=C_LUT[__ldcs(&usw[k>>4])]*uinv;
+            float sg=hw_e4m3(__ldcs(&gsw[k>>4]))*ginv, su=hw_e4m3(__ldcs(&usw[k>>4]))*uinv;
             const unsigned char* wgb=(const unsigned char*)&wg[u]; const unsigned char* wub=(const unsigned char*)&wu[u];
             __half2 g2=__float2half2_rn(0.f),u2=__float2half2_rn(0.f);
             #pragma unroll
@@ -276,7 +278,7 @@ __global__ void k_moe_gateup_grouped(__half* hbuf,const __half* x2,const int* ec
         float ag[4]={0,0,0,0},au[4]={0,0,0,0}; const __half* xp[4];
         for(int c=0;c<nb;++c){ xp[c]=x2+(size_t)(elist[e*EL+base+c]/8)*H; }
         for(int vi=lane;vi<nu;vi+=32){ int k=vi*8;
-            unsigned wg=__ldcs(&gpw[vi]); float sg=C_LUT[__ldcs(&gsw[k>>4])]*ginv; unsigned wu=__ldcs(&upw[vi]); float su=C_LUT[__ldcs(&usw[k>>4])]*uinv;
+            unsigned wg=__ldcs(&gpw[vi]); float sg=hw_e4m3(__ldcs(&gsw[k>>4]))*ginv; unsigned wu=__ldcs(&upw[vi]); float su=hw_e4m3(__ldcs(&usw[k>>4]))*uinv;
             const unsigned char* wgb=(const unsigned char*)&wg; const unsigned char* wub=(const unsigned char*)&wu;
             __half2 gd0=dec_fp4x2(wgb[0]),gd1=dec_fp4x2(wgb[1]),gd2=dec_fp4x2(wgb[2]),gd3=dec_fp4x2(wgb[3]);
             __half2 ud0=dec_fp4x2(wub[0]),ud1=dec_fp4x2(wub[1]),ud2=dec_fp4x2(wub[2]),ud3=dec_fp4x2(wub[3]);
@@ -307,8 +309,8 @@ __global__ void k_moe_down(float* out,const __half* hbuf,const int* ids,const fl
             uint4 hpk=*(const uint4*)(hbuf+((size_t)t*8+j)*MI+k); const __half2* hh2=(const __half2*)&hpk;  // shared by d0,d1
             const unsigned* dpw0=(const unsigned*)(dp[e]+(size_t)d0*(MI/2)); const uint8_t* dsw0=ds[e]+(size_t)d0*(MI/16);
             const unsigned* dpw1=(const unsigned*)(dp[e]+(size_t)(d0+1)*(MI/2)); const uint8_t* dsw1=ds[e]+(size_t)(d0+1)*(MI/16);
-            unsigned wd0=__ldcs(&dpw0[vi]); float sc0=C_LUT[__ldcs(&dsw0[k>>4])]*WI[j];
-            unsigned wd1=__ldcs(&dpw1[vi]); float sc1=C_LUT[__ldcs(&dsw1[k>>4])]*WI[j];
+            unsigned wd0=__ldcs(&dpw0[vi]); float sc0=hw_e4m3(__ldcs(&dsw0[k>>4]))*WI[j];
+            unsigned wd1=__ldcs(&dpw1[vi]); float sc1=hw_e4m3(__ldcs(&dsw1[k>>4]))*WI[j];
             const unsigned char* w0=(const unsigned char*)&wd0; const unsigned char* w1=(const unsigned char*)&wd1;
             __half2 s20=__float2half2_rn(0.f),s21=__float2half2_rn(0.f);
             #pragma unroll
@@ -334,8 +336,8 @@ __global__ void k_moe_down_bw(float* dpart,const __half* hbuf,const int* ecount,
         float a0[4]={0,0,0,0},a1[4]={0,0,0,0}; const __half* hp[4]; int tj[4];
         for(int c=0;c<nb;++c){ tj[c]=elist[e*EL+base+c]; hp[c]=hbuf+(size_t)tj[c]*MI; }
         for(int vi=lane;vi<nu;vi+=32){ int k=vi*8;
-            unsigned wd0=__ldcs(&dpw0[vi]); float sc0=C_LUT[__ldcs(&dsw0[k>>4])]*dinv;   // WEIGHT read ONCE per vi
-            unsigned wd1=__ldcs(&dpw1[vi]); float sc1=C_LUT[__ldcs(&dsw1[k>>4])]*dinv;
+            unsigned wd0=__ldcs(&dpw0[vi]); float sc0=hw_e4m3(__ldcs(&dsw0[k>>4]))*dinv;   // WEIGHT read ONCE per vi
+            unsigned wd1=__ldcs(&dpw1[vi]); float sc1=hw_e4m3(__ldcs(&dsw1[k>>4]))*dinv;
             const unsigned char* wb0=(const unsigned char*)&wd0; const unsigned char* wb1=(const unsigned char*)&wd1;
             __half2 d0a=dec_fp4x2(wb0[0]),d0b=dec_fp4x2(wb0[1]),d0c=dec_fp4x2(wb0[2]),d0d=dec_fp4x2(wb0[3]);
             __half2 d1a=dec_fp4x2(wb1[0]),d1b=dec_fp4x2(wb1[1]),d1c=dec_fp4x2(wb1[2]),d1d=dec_fp4x2(wb1[3]);

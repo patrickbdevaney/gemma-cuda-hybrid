@@ -14,3 +14,12 @@ Baseline: base 44 tok/s (~29% of ~152 roofline), DFlash 84.3. Champion metric pe
 ## LOOP STATE: 2 research streams running (M=1-GEMV-zenith + draft/megakernel-zenith). Kernel-guessing regresses
 ## (fp4_gemv prefetch, draft-FP4 both LOST) -> awaiting PROVEN techniques from research before next grind.
 ## base 44.5 / DFlash 84.3 intact. Next: grind per research findings (M=1 GEMV floor kernel + megakernel MVP).
+
+## iter3: MoE C_LUT -> HW cvt.e4m3 (research #1, kill divergent constant lookup). base 44.35->44.6, DFlash 84.3->84.7
+## (marginal +0.5%; my constant-cache lookup wasn't the big bottleneck the research assumed, but it's cleaner). KEPT.
+## RESEARCH DELIVERED (2 streams): CRITICAL - Thor = 20 SMs not 96 (SM-idle 5x smaller; launch/megakernel is #1).
+## NVFP4 roofline = ~137 tok/s (89 @65%); base 44 = ~50% -> ~2x headroom. Ranked levers:
+##  1. CUDA graphs (base done; DFlash draft eager but only ~7% measured). 2. FP8 DRAFT weights (not FP4 - keeps
+##  acceptance, halves draft bytes, ~2x draft). 3. Megakernel (draft first, hand-writable; base via MPK). 4. FlashNorm
+##  fold RMSNorm into GEMM (12-35% norms). 5. Fuse gate+up+SiLU register-intermediate (Cursor warp-decode 1.84x).
+## Kernel micro-opts near limit (marginal). Next: FP8 draft (real ~2x draft potential) or fuse-gate+up (Cursor).
