@@ -43,3 +43,11 @@ Baseline: base 44 tok/s (~29% of ~152 roofline), DFlash 84.3. Champion metric pe
 ## structural limit. Remaining base levers require RESTRUCTURE: cp.async producer/consumer (lever B, same alignment
 ## care needed) or megakernel. Next: lever C (FP8 draft) - the user's draft-model focus, untried at FP8 (FP4 failed
 ## on acceptance; FP8/E4M3 has less error -> may keep tau 13.3 while halving the bandwidth-bound FC bytes).
+
+## iter5: lever C FP8 draft (E4M3, proper k_linear_fp8, half bytes) -> LOST. DFlash 84.7->71.1, accept 13.33->11.14
+## (IDENTICAL drop to FP4). DEFINITIVE: the DFlash draft is precision-sensitive - ANY weight quant (FP4 or FP8)
+## collapses acceptance to 11.14. The draft MUST stay bf16 (research's "FP8 keeps acceptance" holds for typical
+## EAGLE drafts, NOT this block-diffusion DFlash draft which shares embed+lmhead and injects target K/V). Reverted.
+## => CLOSED: base micro-tuning (exhausted), draft quant (FP4+FP8 both lost). Remaining = RESTRUCTURES only:
+##   cp.async base GEMV (lever B, uncertain per hackathon) | megakernel (huge) | fused-MoE (graphed=minimal).
+## Champion HELD: base 44.6 / DFlash 84.7. The draft's bf16 + high tau 13.3 IS the moat - don't touch it.
