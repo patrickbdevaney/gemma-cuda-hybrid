@@ -68,6 +68,23 @@ extern "C" long cutlass_workspace_bytes(int M,int N,int K){
     return (long)Gemm::get_workspace_size(a);
 }
 
+// ---- scale swizzle: our LINEAR e4m3 scales [rows][K/16] -> CUTLASS blocked SFA/SFB layout ----
+template<class LSF>
+__global__ void k_swizzle(uint8_t* out, const uint8_t* in_lin, LSF lay, int rows, int Kg){
+    long idx=(long)blockIdx.x*256+threadIdx.x; if(idx>=(long)rows*Kg)return;
+    int r=idx/Kg, g=idx%Kg;
+    long off = lay(r, g*16, 0);          // 3-arg cute layout: (row, k-element, L) -> swizzled offset
+    out[off] = in_lin[(long)r*Kg+g];
+}
+extern "C" void cutlass_swizzle_sfa(uint8_t* out,const uint8_t* in,int M,int N,int K,cudaStream_t s){
+    auto lay=Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(M,N,K,1)); int Kg=K/16;
+    k_swizzle<<<(long)(M*Kg+255)/256,256,0,s>>>(out,in,lay,M,Kg);
+}
+extern "C" void cutlass_swizzle_sfb(uint8_t* out,const uint8_t* in,int M,int N,int K,cudaStream_t s){
+    auto lay=Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(M,N,K,1)); int Kg=K/16;
+    k_swizzle<<<(long)(N*Kg+255)/256,256,0,s>>>(out,in,lay,N,Kg);
+}
+
 // D = alpha * A@B^T.  A_fp4/B_fp4 = packed E2M1 (2 codes/byte). SFA/SFB = swizzled e4m3. workspace pre-alloc'd.
 extern "C" int cutlass_nvfp4_gemm(void* D, const void* A_fp4, const void* B_fp4,
                                   const void* SFA, const void* SFB, float alpha,
@@ -92,37 +109,51 @@ extern "C" int cutlass_nvfp4_gemm(void* D, const void* A_fp4, const void* B_fp4,
 
 #ifdef CUTLASS_MOE_TEST
 #include <cuda_runtime.h>
+#include <cuda_fp8.h>
+__device__ float e2m1d(int c){ const float v[8]={0,.5f,1,1.5f,2,3,4,6}; float m=v[c&7]; return (c&8)?-m:m; }
+__device__ float e4m3d(uint8_t b){ __nv_fp8_e4m3 x; *(uint8_t*)&x=b; return (float)x; }
+// reference: D[i][j] = alpha * sum_k e2m1(A code)*e4m3(As grp) * e2m1(B code)*e4m3(Bs grp)
+__global__ void refgemm(float* D,const uint8_t* A,const uint8_t* B,const uint8_t* As,const uint8_t* Bs,int M,int N,int K,float alpha){
+    int i=blockIdx.x, j=blockIdx.y*256+threadIdx.x; if(i>=M||j>=N)return; int Kg=K/16; float acc=0;
+    for(int k=0;k<K;k++){ int ac=(A[(long)i*K/2+k/2]>>((k&1)*4))&0xf; int bc=(B[(long)j*K/2+k/2]>>((k&1)*4))&0xf;
+        float av=e2m1d(ac)*e4m3d(As[(long)i*Kg+k/16]); float bv=e2m1d(bc)*e4m3d(Bs[(long)j*Kg+k/16]); acc+=av*bv; }
+    D[(long)i*N+j]=alpha*acc;
+}
+__global__ void bf2ff(const uint16_t* b,float* f,int n){int i=blockIdx.x*256+threadIdx.x; if(i<n){unsigned u=(unsigned)b[i]<<16;float x;memcpy(&x,&u,4);f[i]=x;}}
+__global__ void frand(uint8_t* p,long n,int s){long i=(long)blockIdx.x*256+threadIdx.x; if(i<n)p[i]=(uint8_t)((i*2654435761u+s*40503u)>>13);}
+__global__ void srand8(uint8_t* p,long n,int s){long i=(long)blockIdx.x*256+threadIdx.x; if(i<n)p[i]=(uint8_t)(0x34+(((i*97+s)>>2)&7));} // e4m3 ~0.75..1.5
+int validate_random(int M,int N,int K){
+    long aB=(long)M*K/2,bB=(long)N*K/2,asB=(long)M*K/16,bsB=(long)N*K/16;
+    long sfaB=cutlass_sfa_bytes(M,N,K),sfbB=cutlass_sfb_bytes(M,N,K),wsB=cutlass_workspace_bytes(M,N,K);
+    uint8_t *A,*B,*As,*Bs,*SFA,*SFB; void *D,*WS; float *Dw,*Dr;
+    cudaMalloc(&A,aB);cudaMalloc(&B,bB);cudaMalloc(&As,asB);cudaMalloc(&Bs,bsB);
+    cudaMalloc(&SFA,sfaB);cudaMalloc(&SFB,sfbB);cudaMalloc(&D,(long)M*N*2);cudaMalloc(&WS,wsB>0?wsB:16);
+    cudaMalloc(&Dw,(long)M*N*4);cudaMalloc(&Dr,(long)M*N*4);
+    frand<<<(aB+255)/256,256>>>(A,aB,1);frand<<<(bB+255)/256,256>>>(B,bB,2);
+    srand8<<<(asB+255)/256,256>>>(As,asB,3);srand8<<<(bsB+255)/256,256>>>(Bs,bsB,4);
+    cudaMemset(SFA,0,sfaB);cudaMemset(SFB,0,sfbB);cudaDeviceSynchronize();
+    cutlass_swizzle_sfa(SFA,As,M,N,K,0); cutlass_swizzle_sfb(SFB,Bs,M,N,K,0); cudaDeviceSynchronize();
+    int rc=cutlass_nvfp4_gemm(D,A,B,SFA,SFB,1.0f,M,N,K,WS,0);
+    bf2ff<<<(M*N+255)/256,256>>>((uint16_t*)D,Dw,M*N);
+    dim3 gb(M,(N+255)/256); refgemm<<<gb,256>>>(Dr,A,B,As,Bs,M,N,K,1.0f); cudaDeviceSynchronize();
+    float *hw=(float*)malloc(M*N*4),*hr=(float*)malloc(M*N*4);
+    cudaMemcpy(hw,Dw,(long)M*N*4,cudaMemcpyDeviceToHost);cudaMemcpy(hr,Dr,(long)M*N*4,cudaMemcpyDeviceToHost);
+    float maxrel=0; int bad=0;
+    for(long t=0;t<(long)M*N;t++){ float d=fabsf(hw[t]-hr[t]),r=d/(fabsf(hr[t])+1e-3f); if(r>maxrel)maxrel=r; if(r>0.05f)bad++; }
+    printf("VALIDATE M=%d N=%d K=%d: rc=%d  wrapper[0]=%.2f ref[0]=%.2f  maxrel=%.4f bad(>5%%)=%d/%ld -> %s\n",
+           M,N,K,rc,hw[0],hr[0],maxrel,bad,(long)M*N, (rc==0&&maxrel<0.06f)?"PASS ✅":"FAIL ❌");
+    free(hw);free(hr); return (rc==0&&maxrel<0.06f)?0:1;
+}
+
 __global__ void fill(uint8_t* p,long n,int v){ long i=blockIdx.x*256L+threadIdx.x; if(i<n)p[i]=(uint8_t)((i*131+v)&0xff); }
 __global__ void bf16_to_f(const uint16_t* b,float* f,int n){int i=blockIdx.x*256+threadIdx.x; if(i<n){unsigned u=(unsigned)b[i]<<16; float x; memcpy(&x,&u,4); f[i]=x;}}
-int main(int argc,char**argv){
-    int M=16,N=2816,K=2816;
-    // KNOWN input: every value = code2(=1.0) * scale. code byte 0x22 = two 1.0 codes. sweep scale byte via argv[1].
-    int scb = argc>1?atoi(argv[1]):0x38;   // e4m3 1.0 = 0x38 (guess); D should = K=2816 when scale=1.0
-    {
-    long aB=(long)M*K/2, bB=(long)N*K/2, sfaB=cutlass_sfa_bytes(M,N,K), sfbB=cutlass_sfb_bytes(M,N,K), wsB=cutlass_workspace_bytes(M,N,K);
-    void *A,*B,*SFA,*SFB,*D,*WS; float* Df;
-    cudaMalloc(&A,aB);cudaMalloc(&B,bB);cudaMalloc(&SFA,sfaB);cudaMalloc(&SFB,sfbB);cudaMalloc(&D,(long)M*N*2);cudaMalloc(&WS,wsB>0?wsB:16);cudaMalloc(&Df,(long)M*N*4);
-    cudaMemset(A,0x22,aB);cudaMemset(B,0x22,bB);cudaMemset(SFA,scb,sfaB);cudaMemset(SFB,scb,sfbB);cudaDeviceSynchronize();
-    int rc=cutlass_nvfp4_gemm(D,A,B,SFA,SFB,1.0f,M,N,K,WS,0); cudaError_t e=cudaDeviceSynchronize();
-    bf16_to_f<<<(M*N+255)/256,256>>>((uint16_t*)D,Df,M*N); cudaDeviceSynchronize();
-    float h[4]; cudaMemcpy(h,Df,16,cudaMemcpyDeviceToHost);
-    printf("scale_byte=0x%02x rc=%d cuda=%s  D[0..3]= %.1f %.1f %.1f %.1f  (expect %d if scale=1.0)\n",scb,rc,cudaGetErrorString(e),h[0],h[1],h[2],h[3],K);
-    return 0; }
-    int M2=16,N2=2816,K2=2816; (void)M2;(void)N2;(void)K2;
-    long aB=(long)M*K/2, bB=(long)N*K/2, sfaB=cutlass_sfa_bytes(M,N,K), sfbB=cutlass_sfb_bytes(M,N,K), wsB=cutlass_workspace_bytes(M,N,K);
-    printf("sizes: A_fp4=%ld B_fp4=%ld SFA=%ld SFB=%ld ws=%ld bytes\n",aB,bB,sfaB,sfbB,wsB);
-    void *A,*B,*SFA,*SFB,*D,*WS;
-    cudaMalloc(&A,aB);cudaMalloc(&B,bB);cudaMalloc(&SFA,sfaB);cudaMalloc(&SFB,sfbB);cudaMalloc(&D,(long)M*N*2);cudaMalloc(&WS,wsB>0?wsB:16);
-    fill<<<(aB+255)/256,256>>>((uint8_t*)A,aB,1); fill<<<(bB+255)/256,256>>>((uint8_t*)B,bB,7);
-    fill<<<(sfaB+255)/256,256>>>((uint8_t*)SFA,sfaB,60); fill<<<(sfbB+255)/256,256>>>((uint8_t*)SFB,sfbB,60);
-    cudaDeviceSynchronize();
-    int rc=cutlass_nvfp4_gemm(D,A,B,SFA,SFB,1.0f,M,N,K,WS,0);
-    cudaError_t e=cudaDeviceSynchronize();
-    printf("cutlass_nvfp4_gemm rc=%d cuda=%s\n",rc,cudaGetErrorString(e));
-    // check output finite
-    uint16_t h[8]; cudaMemcpy(h,D,16,cudaMemcpyDeviceToHost);
-    printf("D[0..3] raw bf16: %04x %04x %04x %04x\n",h[0],h[1],h[2],h[3]);
-    printf(rc==0 && e==cudaSuccess ? "SMOKE TEST: WRAPPER RUNS OK\n":"SMOKE TEST: FAILED\n");
-    return rc;
+int main(int,char**){
+    printf("=== end-to-end validation (random FP4 + swizzle vs fp32 reference) ===\n");
+    int r=0;
+    r|=validate_random(16,2816,704);    // down shape (per verify-MoE)
+    r|=validate_random(16,704,2816);    // gateup shape
+    r|=validate_random(128,2816,2816);  // larger square
+    printf(r==0? "\nALL VALIDATIONS PASS -- swizzle + wrapper correct.\n":"\nSOME VALIDATION FAILED.\n");
+    return r;
 }
 #endif
