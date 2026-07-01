@@ -61,3 +61,13 @@ register-limited by acc[15]. Hard nut - left on tuned CUDA-core.
 ## ARC TOTAL: 85.65 -> 96.38 (+12.5%). vs vLLM 107 (was 22 behind, now ~11). step 157->~138ms. ceiling 157.
 ## Banked levers: dense-TC (Marlin raw-mma, in-reg dequant, no-shared, grid-fill), MoE gateup+down U4 prefetch.
 ## Remaining (harder): lm_head fused/FP8, FlashInfer attn (8%), dense-TC toward 2-4x Marlin, MoE split-K.
+
+## lm_head FP4 attempt (2026-07-01) — DEAD END, reverted
+Verify lm_head uses k_lmhead_batched (bf16 embed, 1.5GB reads). Switched to FP4 embed (369MB, 4x fewer bytes) via
+w4a16_gemm AND via tc_w4a16: both ~-1% (bit-exact, gate PASS). The bf16 k_lmhead_batched is ALREADY efficient
+(block-per-vocab + shared embed-row reuse + VOCAB-block grid = coalesced, full fill); FP4 kernels are latency-bound
+at N=VOCAB and don't beat it. lm_head is NOT a tractable win. Reverted to bf16.
+## FINAL ARC STATE: base 45 / DFlash 96.4 (85.65->96.4 = +12.5%). vs vLLM 107 (~11 behind, was 22). tau moat 13.33 intact.
+## Banked: MoE gateup+down prefetch, Marlin TC verify GEMM (raw-mma, in-reg dequant, no-shared, grid-fill WARPS=1).
+## Exhausted/dead-end: lm_head (bf16 already good), attention (balanced 50-60%/95% occ). Remaining = offline weight
+## repack for dense-TC coalescing (core Marlin, complex, ~+5%) - the only clear lever left, a major build.
