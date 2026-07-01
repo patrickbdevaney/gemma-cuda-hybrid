@@ -53,3 +53,15 @@ Megakernel: deferred (1.0-1.7x vs tuned; MoE forces dynamic scheduling; draft+ve
 - NEXT bandwidth levers: (a) reduce per-element decode overhead / overlap loads (cp.async double-buffer — conflicting
   research on batch-1); (b) apply weight-once to any remaining per-token kernels; (c) FP8 KV for attention bytes.
   Each is ~+2-5%; stacking across kernels is the path to ~2x. This build is the validated template.
+
+## PROFILE FINDING (2026-07-01) — the MoE is COMPUTE-bound, which re-opens TC
+- k_moe_down_bw = 752us (vs old down 787us) — the weight dedup gained ~4%, NOT the 2.7x roofline. => the down is
+  COMPUTE-bound (per-element dec_fp4x2 + half2 FMA tree), not weight-read-bound. Agent 1's "bandwidth-bound" roofline
+  assumed an already-efficient kernel; my half2 decode compute is the actual bottleneck.
+- IMPLICATION (redirect): for a COMPUTE-bound FP4 MoE, TENSOR CORES (HW decode + MMA) are the RIGHT tool — they do
+  in hardware exactly the compute that bottlenecks my half2. My earlier "TC break-even" verdict assumed the kernel
+  was bandwidth-bound; it's not. Re-open the CUTLASS grouped TC down: single-GEMM measured ~8us at the down shape;
+  79 experts grouped (concurrent across SMs) plausibly < my 752us -> the real ~2x lever after all, IF it clears the
+  W4A4 accuracy bar (5.5% GEMM error -> must verify acceptance holds).
+- NEXT: build the CUTLASS GROUPED (kGrouped/MoEProblemShape) TC down + gateup (W4A4), validate acceptance end-to-end.
+  This is the substantial build the earlier "TC is wrong" verdict wrongly deferred. bandwidth-down stays (+2.8%, harmless).
