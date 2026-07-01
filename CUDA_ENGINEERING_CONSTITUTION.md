@@ -73,3 +73,43 @@ Purpose-built pure-CUDA NVFP4 + DFlash spec-decode server for `google/gemma-4-26
 - N must be divisible by 8 for the tc (true for qkv/o/VOCAB); K divisible by 128 for the 16B-int4 repack (2816, 4096 OK).
 - Full layers hd=512 → naive shared attention exceeds 48KB → keep qs/acc in registers.
 - `k_lmhead_batched` (bf16) is ALREADY efficient (block-per-vocab + shared reuse) — don't "optimize" to FP4 (neutral).
+
+---
+
+## 10. FULL CUMULATIVE IMPROVEMENT LEDGER (both repos — transferable to ANY MoE/NVFP4 inference on Thor)
+Every measured improvement across `gemma-cuda-server` (v1.0, built decode 0→82) and `gemma-cuda-hybrid` (v2.0, 82→118). Each is a TRANSFERABLE pattern for MoE + NVFP4 + spec-decode on sm_110a. Grouped by technique class.
+
+### A. CORRECTNESS FOUNDATION (gemma-cuda-server, must-have before any speed work)
+- NVFP4 safetensors loader + cublasLt NVFP4 GEMM + scale-swizzle converter (validated maxrel 0.4% vs fp32 ref on real 16GB ckpt).
+- Full 30-layer forward → **gate PASS = top-1 matches vLLM** on confident prompts. Precision unification: **W4A16 everywhere** (fp16 act, FP4 weight) → DFlash==base==vLLM bit-exact. (W4A4 tested: 5.5% quant err erodes acceptance — W4A16 is the accuracy/speed sweet spot.)
+- DFlash draft/verify end-to-end, acceptance gate (tau 4.0 → tuned DK=14 → tau 13.33). Draft bug fixes: within-block attention must be CAUSAL for sliding layers 0-3, non-causal only full layer.
+
+### B. BASE DECODE M=1 (gemma-cuda-server, 6.45 → ~45 tok/s) — transferable GEMV/MoE patterns
+- **fp16 activations for GEMV** (ncu-guided): decode is memory-bound; fp16 acts halve the act traffic. +key.
+- **HW FP4 decode** `cvt.f16x2.e2m1x2` (later `__nv_cvt_fp4x2_to_halfraw2`) + **half2** math: 15.81→18.52 (+17%). Replaced shared-mem e4m3 LUT with register HW cvt.
+- **warp-per-output GEMV** (vs block-per-output): 6.45→11.02 (+71%). Vectorized uint32 weight loads.
+- **MoE HW decode + fp16 + half2** in gateup/down: 18.52→21.40 (+15%).
+- **MoE down warp-per-(t,d), 8 experts FUSED into one accumulator** → ONE shfl reduce (vs 8 block reductions, 34% util before): 21.3→25.9 (+22%). `__ldcs` streaming.
+- **Parallel router top-8**: 128-thread reduction-argmax (was 1 thread/1024 ops): +5.5%.
+- **CUDA-graph base decode**: 30.73→34.18 (+11.2%). Kills launch overhead for the M=1 tiny-op chain.
+- LOST here: uint4 lmhead (embed 8B-align), constant-mem e4m3 LUT (neutral), FP8 lm_head (fp8 decode not free on Thor), warp-per-output MoE (2× tried, failed — block-per-output better for that shape).
+
+### C. DFLASH SPEC-DECODE (gemma-cuda-server, the multiplier: base×tau) — transferable to ANY draft+verify
+- **half2 draft linear**: DFlash 31.34→37.42 (+19.4%). **half2 verify lmhead** (weight decoded once, reused across M): 42.05→51.22 (+21.8%).
+- **incremental draft context** (only new positions' K/V): 37.42→42.05 (+12.4%).
+- **grouped verify MoE gateup** (group tokens by expert, weight-resident): 51.87→59.72 (+15.1%).
+- **batched lm_head** (warp-per-n, reuse W across M positions) + **device argmax** (no D2H copy + host argmax): 26.2→31.46.
+- **NVFP4 verify lm_head** (+6.9%) then **NVFP4 draft lm_head** (+26%, 65→82): the tied embed quantized to FP4 = 4× less lm_head traffic. THE v1.0 breakthrough.
+- **T>0 typical-acceptance** feature (exact-parity greedy; helps low-accept workloads; no-op on primes).
+- LOST: tree/multi-round verify (net-negative on primes — depth-dominated, linear DFlash better), draft→FP4/FP8 (collapses tau 13.33→11.14 — **draft MUST stay bf16, it IS the moat**).
+
+### D. MARLIN-CLASS TC + DEEP-RESEARCH ARC (gemma-cuda-hybrid, 82 → 118) — the biggest transferable wins
+- **Raw `mma.sync.m16n8k16` TC GEMM with in-register FP4→fp16 dequant** (B straight to fragment, no shared round-trip): the naive wmma was −5%; the Marlin-class hand-pipeline BEAT CUDA-core (+3.3% dense). Fragment layout derived in §5.3.
+- **Offline weight REPACK** into mma-fragment/coalesced order (cached by ptr, lazy on warm-up = graph-safe): +1.6%. Then **16-byte int4 loads + `__ldcs` evict-first**: +3.5%. **Software-pipelined weight prefetch U=8**: +1.9%. **WARPS=1 grid-fill + no-shared-A (direct L2)**: +3.1%.
+- **THE TWO BIG ONES (deep-research-driven):** route **draft+verify LM_HEADS through the tc kernel** (they were still warp-per-column CUDA-core — the biggest kernel at 22%): **+9.7%** → beat vLLM. Then **draft LINEARS through a bf16 TC GEMM** (mma.f16.f16.f32, bf16→f16 weights, no dequant): **+9.3%, tau unchanged, output bit-exact**.
+- **MoE gateup+down U=4 K-unroll prefetch** (SoL: latency-bound): +5%. **MoE weight-resident down** (no atomics + finalize): +2.8%.
+- **Attention head-pack** (one block/(query,kv_head), KV read once vs 4× GQA-redundant): +0.6% short-ctx (bigger long-ctx).
+- **DEAD-ENDS measured (don't repeat):** CUTLASS/tcgen05 TC for M≤16 (padding waste, M=15 is 60× under compute roof, MMA_M locked 128); megakernel M1/M2/full-step (grid-barrier overhead dominates M=1 tiny ops — wrong regime vs Hazy big-op); cp.async pipeline (max-grid-fill hides latency at BLOCK level, not warp); MoE ILP split (register wall); TC grouped MoE (~1 tok/expert padding).
+
+### E. THE TRANSFERABLE META-PLAYBOOK (apply to any new MoE/NVFP4 model on Thor)
+1. Correctness first: W4A16, gate vs reference, bit-exact. 2. Profile with ncu SoL EVERY step — latency-bound (both<60%)→prefetch/more-ILP-or-blocks; bandwidth→16B int4+evict-first+repack; grid-too-small→WARPS=1. 3. The bottleneck MOVES after each win — re-profile (ours went lm_head→draft-linear→MoE). 4. At M=8-16 (spec verify), warp-per-column CUDA-core GEMMs are LATENCY-BOUND — route through raw `mma.sync` TC (NOT CUTLASS/tcgen05, which need M≥128). This single pattern gave +9.7% AND +9.3%. 5. Spec-decode draft must stay high-precision (bf16) — quantizing it destroys the tau moat. 6. Back-to-back A/B always (thermal). 7. Repack weights offline into fragment/coalesced order, cache by ptr, lazy on warm-up (graph-safe).
