@@ -21,3 +21,18 @@
   draft (tau 10-13 vs vLLM 7.84) + keep our NVFP4 lm_head (vLLM eats bf16). All proven-feasible on 13.0.
 - Build flags that work: -gencode arch=compute_110a,code=sm_110a, -I cutlass/include + tools/util/include.
   Callable from C++ via flashinfer CutlassFp4GemmRunner (torch-free header) OR direct CUTLASS CollectiveBuilder.
+
+## STEP 3 BENCHMARK (2026-07-01) — the honest per-kernel numbers
+- True CUTLASS NVFP4 GEMM kernel time (nsys, validated wrapper): **~11us** at verify shapes
+  (8us down M16xN2816xK704, 11us square M128xN2816xK2816).
+- DENSE verify GEMMs (M=15 single): CUTLASS 11us vs my half2 ~20us = **~2x faster** -> ~+10% (dense is modest %).
+- GROUPED MoE (verify: ~2 tokens/expert): M=2 padded to 128-tile = ~64x compute WASTE, which roughly cancels
+  the TC throughput win -> **~break-even with half2's 787us**, NOT the 5x I projected. Padding is the killer
+  at tiny per-expert M.
+- HONEST VERDICT: CUTLASS TC is a ~+10-15% lever (dense speedup), NOT the 2x needed to reach vLLM's 100.
+  The remaining gap is the FULL PIPELINE (vLLM's whole-step graph + tuned attention + every kernel), i.e. the
+  "re-implement the stack" the research warned about. Matching vLLM 100 in hand-written CUDA is a much larger
+  effort than a single kernel swap.
+- REVISED priority: (1) FULL-STEP CUDA GRAPH (pure CUDA, vLLM's key advantage, no CUTLASS needed) is likely the
+  bigger single lever; (2) TC dense GEMMs (+10%, primitive validated & ready in cutlass_moe.cu); (3) TC grouped
+  MoE only if per-expert token count rises (not at k=15 verify).
