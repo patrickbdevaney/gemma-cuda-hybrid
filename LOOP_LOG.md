@@ -115,3 +115,14 @@ Baseline: base 44 tok/s (~29% of ~152 roofline), DFlash 84.3. Champion metric pe
 ## To win, ALL ops must live in ONE persistent kernel (weeks-long instruction-interpreter build). Measured expected
 ## payoff still ~1.0-1.2x for M=1-graphed -> base ~48-52 / DFlash ~90-98, NOT >100 on base. M1+M2 stand as the proven,
 ## bit-exact foundation + the measured evidence that only the full single-kernel could win (uncertain, weeks).
+
+## === FULL-STEP Stage-1 (grid-cooperative rmsnorm+QKV) BUILT + MEASURED — pivotal finding ===
+## mega_af_kernel: grid-cooperative input_rmsnorm (grid-reduce sum(h^2) via atomicAdd + 2 grid_bar barriers) + QKV.
+## VERIFIED BIT-EXACT. Speed: 42.7 vs champion 44.75 = -4.5% (WORSE than M1's block-0 producer-consumer at 0%).
+## => The GRID-BARRIER (the mechanism the full-step layer-loop REQUIRES for op-sequencing across the persistent grid)
+## costs measurably at M=1: ~60 barriers (2/layer x30) = -4.5% vs block-0. The full-step needs ~390 op-sequencing
+## barriers/step (13 ops x 30 layers) -> extrapolated overhead is LARGE. This is the WRONG regime for a megakernel:
+## Hazy's 2.5x was Llama-1B with BIG ops (barrier cost small vs op time); our M=1 MoE has TINY ops (barrier cost
+## dominates). MEASURED trajectory: M1 block-0 0%, M2 grid-barrier -1.5%, grid-coop reduce -4.5% - consistently
+## NEGATIVE and worsening with more barriers. Reverted wiring to M1's mega_qkv (best, -1.5% w/ M2). mega_af retained
+## as the measured evidence. CONCLUSION (now measured, not estimated): the full-step megakernel LOSES for M=1 Thor.

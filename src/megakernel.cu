@@ -63,6 +63,52 @@ __global__ void mega_qkv_kernel(float* q,float* k,float* v,
     }
 }
 
+// ================= FULL-STEP architecture (grid-cooperative, single persistent kernel) =================
+// grid-wide barrier: all NB resident blocks must reach bar[phase] before any proceeds. NB<=residency => no deadlock.
+__device__ __forceinline__ void grid_bar(int* barp,int NB){
+    __syncthreads(); __threadfence();
+    if(threadIdx.x==0) atomicAdd(barp,1);
+    if(threadIdx.x==0){ while(*(volatile int*)barp < NB){} }
+    __syncthreads();
+}
+// Stage-1 instruction block: grid-cooperative input_rmsnorm + Q/K/V proj (foundation for the full-step layer loop).
+// Phase0: grid-reduce sum(h^2). bar. Phase1: hnorm16 slices. bar. Phase2: QKV GEMV.
+__global__ void mega_af_kernel(float* q,float* k,float* v,const float* h,const uint16_t* g,
+    __half* hnorm16,float* sumsq,int* bar,
+    const uint8_t* qp,const uint8_t* qs,float qwi,
+    const uint8_t* kp,const uint8_t* ks,float kwi,
+    const uint8_t* vp,const uint8_t* vs,float vwi,
+    int H,int qd,int kd,float eps,int NB){
+    int tid=threadIdx.x, lane=tid&31, warp=tid>>5, wpb=blockDim.x>>5;
+    long gtid=(long)blockIdx.x*blockDim.x+tid, gstride=(long)gridDim.x*blockDim.x;
+    __shared__ float ss[256]; float loc=0.f;                       // Phase 0: partial sum(h^2)
+    for(long i=gtid;i<H;i+=gstride){ float x=h[i]; loc+=x*x; }
+    ss[tid]=loc; __syncthreads();
+    for(int s=128;s>0;s>>=1){ if(tid<s)ss[tid]+=ss[tid+s]; __syncthreads(); }
+    if(tid==0) atomicAdd(sumsq,ss[0]);
+    grid_bar(&bar[0],NB);
+    float rinv=rsqrtf(*sumsq/H+eps);                               // Phase 1: hnorm16 (all blocks, own slice)
+    for(long i=gtid;i<H;i+=gstride) hnorm16[i]=__float2half(h[i]*rinv*mbf2f(g[i]));
+    grid_bar(&bar[1],NB);
+    int nv_out=vp?kd:0; long total=(long)qd+kd+nv_out;             // Phase 2: QKV GEMV
+    for(long o=(long)blockIdx.x*wpb+warp; o<total; o+=(long)gridDim.x*wpb){
+        if(o<qd){ float r=mega_dot(qp,qs,qwi,hnorm16,(int)o,H,lane); if(lane==0)q[o]=r; }
+        else if(o<qd+kd){ int n=o-qd; float r=mega_dot(kp,ks,kwi,hnorm16,n,H,lane); if(lane==0)k[n]=r; }
+        else { int n=o-qd-kd; float r=mega_dot(vp,vs,vwi,hnorm16,n,H,lane); if(lane==0)v[n]=r; }
+    }
+}
+extern "C" void mega_attn_front(float* q,float* k,float* v,const float* h,const uint16_t* g,
+    const uint8_t* qp,const uint8_t* qs,float qwg, const uint8_t* kp,const uint8_t* ks,float kwg,
+    const uint8_t* vp,const uint8_t* vs,float vwg, int H,int qd,int kd,float eps,cudaStream_t s){
+    static __half* hnorm16=nullptr; static float* sumsq=nullptr; static int* bar=nullptr; static int NB=0;
+    if(!hnorm16){ MCU(cudaMalloc(&hnorm16,(size_t)16384*sizeof(__half))); MCU(cudaMalloc(&sumsq,4)); MCU(cudaMalloc(&bar,2*sizeof(int)));
+        int maxb=0; cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb,mega_af_kernel,256,0);
+        cudaDeviceProp p; cudaGetDeviceProperties(&p,0); NB=maxb*p.multiProcessorCount; if(NB<1)NB=20; }
+    MCU(cudaMemsetAsync(sumsq,0,4,s)); MCU(cudaMemsetAsync(bar,0,2*sizeof(int),s));
+    mega_af_kernel<<<NB,256,0,s>>>(q,k,v,h,g,hnorm16,sumsq,bar,
+        qp,qs,1.f/qwg, kp,ks,1.f/kwg, vp,vp?vs:nullptr,vp?1.f/vwg:0.f, H,qd,kd,eps,NB);
+}
+
 // M2: fused o_proj + post_attn_norm + residual. GRID-BARRIER class (produce all op, then reduce+add).
 // Launched with NB = resident-capacity blocks so the arrival barrier can't deadlock.
 __global__ void mega_oproj_kernel(float* hres,const float* ao,const uint16_t* g,
