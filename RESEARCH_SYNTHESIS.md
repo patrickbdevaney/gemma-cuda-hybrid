@@ -26,3 +26,19 @@ Megakernel: deferred (1.0-1.7x vs tuned; MoE forces dynamic scheduling; draft+ve
 ## decode lever. PIVOT the integration to #1 (graph) + #2 (bandwidth MoE).
 
 ## gemma-4 verification TODO before MoE build: confirm top-k (8?) + renormalization from HF transformers module.
+
+## MEASURED on-device (2026-07-01) — overturns the graph priority for OUR setup
+- DFlash is **93% GPU-busy** (462ms GPU kernel / 498ms wall, GEN=40). Host/launch tax = only ~7%.
+- => The FULL-STEP GRAPH is a ~7% lever for us (our long 15-tok x 30-layer kernels hide launches), NOT the
+  ARM-scale win agent 2 assumed for naive many-short-kernel pipelines. Deprioritize the graph.
+- => The gap to vLLM (58-82 vs 100) is GPU KERNEL TIME = memory-bandwidth EFFICIENCY. Agent 1's roofline:
+  our MoE is 2.7x above the HBM floor (down 787us vs ~286us). vLLM realizes ~55-60% BW; we realize ~37%.
+
+## THE lever (revised, measured): bandwidth-optimal CUDA-core kernels. Per-kernel work to hit the HBM floor:
+  1. DOWN/GATEUP MoE: reuse each expert weight across ALL routed verify tokens (weight-resident, not per-token
+     re-read ~1.5x); fully-coalesced + double-buffered (cp.async) FP4 stream; minimize C_LUT/decode overhead.
+     Target ~286us/layer (down). ~2.7x headroom.
+  2. verify DENSE (w4a16 M=15): same — weight-once, coalesced, overlap decode. (already reuses weight across M.)
+  3. attention: FP8 KV (halve KV bytes), GQA head-stacking. memory-bound.
+  This is per-kernel bandwidth tuning (multi-session), the honest path to ~2x -> matching/beating vLLM given our
+  BETTER draft (tau 13 vs 7.84) + FP4 lm_head. NOT graph, NOT TC.
