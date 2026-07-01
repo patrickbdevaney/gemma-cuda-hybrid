@@ -8,3 +8,9 @@ Baseline: base 44 tok/s (~29% of ~152 roofline), DFlash 84.3. Champion metric pe
 ## large-N (qkv N=4096, lmhead N=262144) already has enough warps for MLP -> prefetch just adds regs. Reverted.
 ## Base decode profile: fp4_gemv(dense+lmhead) 32.7%, MoE gateup 19.3%+down 12% =31%, rmsnorm 9% (launch-inflated,
 ## hidden in graph). Await M=1-GEMV-zenith research for the specific floor-hitting technique.
+
+## iter2: base rmsnorm = ~10 gemma-4 double-norms/layer, each 1-CTA/1-SM at M=1 (latency-bound, ~2.3ms/token).
+## Structural fusion won't fix it (sequential, different data) — needs a MEGAKERNEL (fuse the layer). Research pending.
+## LOOP STATE: 2 research streams running (M=1-GEMV-zenith + draft/megakernel-zenith). Kernel-guessing regresses
+## (fp4_gemv prefetch, draft-FP4 both LOST) -> awaiting PROVEN techniques from research before next grind.
+## base 44.5 / DFlash 84.3 intact. Next: grind per research findings (M=1 GEMV floor kernel + megakernel MVP).
