@@ -342,17 +342,22 @@ __global__ void k_moe_down_bw(float* dpart,const __half* hbuf,const int* ecount,
     for(int base=0;base<cnt;base+=4){ int nb=cnt-base; if(nb>4)nb=4;
         float a0[4]={0,0,0,0},a1[4]={0,0,0,0}; const __half* hp[4]; int tj[4];
         for(int c=0;c<nb;++c){ tj[c]=elist[e*EL+base+c]; hp[c]=hbuf+(size_t)tj[c]*MI; }
-        for(int vi=lane;vi<nu;vi+=32){ int k=vi*8;
-            unsigned wd0=__ldcs(&dpw0[vi]); float sc0=hw_e4m3(__ldcs(&dsw0[k>>4]))*dinv;   // WEIGHT read ONCE per vi
-            unsigned wd1=__ldcs(&dpw1[vi]); float sc1=hw_e4m3(__ldcs(&dsw1[k>>4]))*dinv;
-            const unsigned char* wb0=(const unsigned char*)&wd0; const unsigned char* wb1=(const unsigned char*)&wd1;
-            __half2 d0a=dec_fp4x2(wb0[0]),d0b=dec_fp4x2(wb0[1]),d0c=dec_fp4x2(wb0[2]),d0d=dec_fp4x2(wb0[3]);
-            __half2 d1a=dec_fp4x2(wb1[0]),d1b=dec_fp4x2(wb1[1]),d1c=dec_fp4x2(wb1[2]),d1d=dec_fp4x2(wb1[3]);
-            for(int c=0;c<nb;++c){ uint4 hpk=*(const uint4*)(hp[c]+k); const __half2* h=(const __half2*)&hpk;
-                __half2 s0=__hadd2(__hadd2(__hmul2(d0a,h[0]),__hmul2(d0b,h[1])),__hadd2(__hmul2(d0c,h[2]),__hmul2(d0d,h[3])));
-                __half2 s1=__hadd2(__hadd2(__hmul2(d1a,h[0]),__hmul2(d1b,h[1])),__hadd2(__hmul2(d1c,h[2]),__hmul2(d1d,h[3])));
-                a0[c]+=sc0*(__half2float(__low2half(s0))+__half2float(__high2half(s0)));
-                a1[c]+=sc1*(__half2float(__low2half(s1))+__half2float(__high2half(s1))); } }
+        const int U=4;   // K-unroll prefetch (SoL: down_bw latency-bound)
+        for(int vi=lane;vi<nu;vi+=32*U){
+            unsigned wd0[U],wd1[U]; int vv[U];
+            #pragma unroll
+            for(int u=0;u<U;++u){ int v=vi+u*32; vv[u]=v; if(v<nu){ wd0[u]=__ldcs(&dpw0[v]); wd1[u]=__ldcs(&dpw1[v]); } }
+            #pragma unroll
+            for(int u=0;u<U;++u){ int v=vv[u]; if(v>=nu) continue; int k=v*8;
+                float sc0=hw_e4m3(__ldcs(&dsw0[k>>4]))*dinv, sc1=hw_e4m3(__ldcs(&dsw1[k>>4]))*dinv;
+                const unsigned char* wb0=(const unsigned char*)&wd0[u]; const unsigned char* wb1=(const unsigned char*)&wd1[u];
+                __half2 d0a=dec_fp4x2(wb0[0]),d0b=dec_fp4x2(wb0[1]),d0c=dec_fp4x2(wb0[2]),d0d=dec_fp4x2(wb0[3]);
+                __half2 d1a=dec_fp4x2(wb1[0]),d1b=dec_fp4x2(wb1[1]),d1c=dec_fp4x2(wb1[2]),d1d=dec_fp4x2(wb1[3]);
+                for(int c=0;c<nb;++c){ uint4 hpk=*(const uint4*)(hp[c]+k); const __half2* h=(const __half2*)&hpk;
+                    __half2 s0=__hadd2(__hadd2(__hmul2(d0a,h[0]),__hmul2(d0b,h[1])),__hadd2(__hmul2(d0c,h[2]),__hmul2(d0d,h[3])));
+                    __half2 s1=__hadd2(__hadd2(__hmul2(d1a,h[0]),__hmul2(d1b,h[1])),__hadd2(__hmul2(d1c,h[2]),__hmul2(d1d,h[3])));
+                    a0[c]+=sc0*(__half2float(__low2half(s0))+__half2float(__high2half(s0)));
+                    a1[c]+=sc1*(__half2float(__low2half(s1))+__half2float(__high2half(s1))); } } }
         for(int c=0;c<nb;++c){
             #pragma unroll
             for(int o=16;o>0;o>>=1){ a0[c]+=__shfl_down_sync(0xffffffffu,a0[c],o); a1[c]+=__shfl_down_sync(0xffffffffu,a1[c],o); }
