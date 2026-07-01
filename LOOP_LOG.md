@@ -75,3 +75,13 @@ Baseline: base 44 tok/s (~29% of ~152 roofline), DFlash 84.3. Champion metric pe
 ## base 44.9 / DFlash 85. The megakernel is real but a distinct major project. Honest recommendation: dedicated build,
 ## explicit go-ahead, not autonomous grinding. The bf16-draft moat (tau 13.3 vs vLLM 7.84) + FP4 lm_head keep DFlash 85
 ## genuinely competitive with vLLM's ~100 despite fewer per-kernel opts.
+
+## === MEGAKERNEL M1 ACHIEVED (2026-07-01) — infrastructure proven correct ===
+## Built src/megakernel.cu: persistent 64-block kernel, global-counter sentinel-sync (NOT grid.sync, graph-safe),
+## fuses input_rmsnorm + Q/K/V proj into ONE kernel. Flag-gated MEGAKERNEL=1 (champion path default/untouched).
+## VERIFIED BIT-EXACT: MEGAKERNEL=1 tokens == champion tokens (GEN=4 & GEN=8 identical). Gate PASS both flag states.
+## Speed 43.3 vs 44.6 (-3%) - EXPECTED for the skeleton: per-layer counter-memset + single-block Phase-A reduction +
+## spin, only 4 of ~15 kernels/layer fused, no cross-op weight prefetch yet. The pattern + correctness are the M1 win.
+## NEXT (M2): extend the SAME persistent kernel to also fold the q/k-norm+RoPE (warp-per-head restructure) and/or
+## chain o_proj+post_norm+residual, amortizing the memset/spin over more fused work toward break-even, then M4
+## cross-op prefetch for the actual speed win. Champion base 44.9 / DFlash 85 HELD (flag off).

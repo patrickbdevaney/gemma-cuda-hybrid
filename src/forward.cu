@@ -17,6 +17,7 @@
 #include <cmath>
 #include <string>
 #include <vector>
+#include "megakernel.h"
 #include <unordered_map>
 #include <algorithm>
 
@@ -515,11 +516,22 @@ static void attention_cached(Model& m, Session& S, float* h, int mtok, int base,
     auto pick=[&](float* d,size_t n)->float*{ if(!big)return d; float* p; CU(cudaMalloc(&p,n*4)); tf.push_back(p); return p; };
     float *hn=pick(DS->hn,mtok*H),*q=pick(DS->q,mtok*qd),*k=pick(DS->k,mtok*kd),*v=pick(DS->v,mtok*kd),
           *ao=pick(DS->ao,mtok*qd),*op=pick(DS->op,mtok*H),*dc=pick(DS->dc,mtok*256),*ds=pick(DS->ds,mtok*256);
+    static bool MEGA = getenv("MEGAKERNEL")!=nullptr;
+    if(MEGA && mtok==1 && !W4A4_TAPS){   // M1: fused input_rmsnorm + Q/K/V proj (persistent counter-synced megakernel)
+        std::string qp_=P+"self_attn.q_proj", kp_=P+"self_attn.k_proj", vp_=P+"self_attn.v_proj";
+        uint8_t *vpp=nullptr,*vps=nullptr; float vwg=1.f;
+        if(!is_full(L)){ vpp=m.dptr<uint8_t*>(vp_+".weight_packed"); vps=m.dptr<uint8_t*>(vp_+".weight_scale"); vwg=m.scalarF32(vp_+".weight_global_scale"); }
+        mega_qkv(q,k,v,h,m.dptr<const uint16_t*>(P+"input_layernorm.weight"),
+            m.dptr<uint8_t*>(qp_+".weight_packed"),m.dptr<uint8_t*>(qp_+".weight_scale"),m.scalarF32(qp_+".weight_global_scale"),
+            m.dptr<uint8_t*>(kp_+".weight_packed"),m.dptr<uint8_t*>(kp_+".weight_scale"),m.scalarF32(kp_+".weight_global_scale"),
+            vpp,vps,vwg, H,qd,kd,EPS,0);
+    } else {
     rmsnorm(hn, h, m.dptr<const uint16_t*>(P+"input_layernorm.weight"), mtok, H, EPS, 0);
     linear(m, q, hn, P+"self_attn.q_proj", mtok, qd, H);
     linear(m, k, hn, P+"self_attn.k_proj", mtok, kd, H);
     if(is_full(L)) CU(cudaMemcpyAsync(v, k, (size_t)mtok*kd*4, cudaMemcpyDeviceToDevice)); // k_eq_v
     else linear(m, v, hn, P+"self_attn.v_proj", mtok, kd, H);
+    }
     rmsnorm(q, q, m.dptr<const uint16_t*>(P+"self_attn.q_norm.weight"), mtok*NHEAD, hd, EPS, 0);
     rmsnorm(k, k, m.dptr<const uint16_t*>(P+"self_attn.k_norm.weight"), mtok*nkv, hd, EPS, 0);
     rmsnorm(v, v, (const uint16_t*)nullptr, mtok*nkv, hd, EPS, 0); // v_norm no scale
