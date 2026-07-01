@@ -14,6 +14,7 @@
 #include "draft.h"
 #include "fp4_gemm.h"
 extern "C" void tc_w4a16_gemm(float*,const uint8_t*,const uint8_t*,float,const void*,int,int,int,cudaStream_t);
+extern "C" void tc_bf16_gemm(float*,const void*,const void*,int,int,int,cudaStream_t);
 #include "safetensors.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -153,7 +154,9 @@ static void linbf(DraftModel* d,float* out,const float* x,const std::string& wna
     if(M<=16){                                                                          // half2: fp16 acts, reuse W across M
         static __half* xf16=nullptr; if(!xf16) CU(cudaMalloc(&xf16,(size_t)16*FCIN*sizeof(__half)));   // K up to FCIN=16896 (fc)
         k_df32to16<<<(unsigned)(((long)M*K+255)/256),256>>>(xf16,x,(long)M*K);
-        k_linear_bf16<<<(unsigned)(((long)N+7)/8),256>>>(out,xf16,W,M,N,K); }
+        static bool noBTC=getenv("NOBF16TC")!=nullptr;
+        if(!noBTC && (N%8==0) && (K%32==0)) tc_bf16_gemm(out, W, xf16, M, N, K, 0);          // Marlin-class bf16 TC (draft numerics only affect tau, verify keeps output bit-exact)
+        else k_linear_bf16<<<(unsigned)(((long)N+7)/8),256>>>(out,xf16,W,M,N,K); }
     else      k_linear_bf16_bigM<<<(unsigned)(((long)M*N+7)/8),256>>>(out,x,W,M,N,K);   // large-M context
 }
 static void rmsn(DraftModel* d,float* out,const float* x,const std::string& wname,int rows,int dim){

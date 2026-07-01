@@ -83,3 +83,53 @@ extern "C" void tc_w4a16_gemm(float* out, const uint8_t* wp, const uint8_t* ws, 
     } else { wpr=it->second.first; wsr=it->second.second; }
     tc_w4a16_kernel<<<(unsigned)((N/8+WARPS-1)/WARPS), WARPS*32, 0, s>>>(out, wpr, wsr, 1.f/w_gscale, (const __half*)x16, M, N, K);
 }
+
+// ==== tc_bf16: TC GEMM for bf16 weights (draft linears), mma f16.f16.f32, weight bf16->f16 repacked (no dequant) ====
+// Same kernel-efficiency win as routing lm_heads through tc: replaces warp-per-column CUDA-core k_linear_bf16 at M<=16.
+__device__ __forceinline__ __half bf2half(uint16_t b){ unsigned u=(unsigned)b<<16; float f; memcpy(&f,&u,4); return __float2half(f); }
+__global__ void k_tc_bf16_repack(__half* wpr, const uint16_t* W, int N, int K){
+    long idx=(long)blockIdx.x*blockDim.x+threadIdx.x; int kg2=K/32; long tot=(long)(N/8)*kg2*32*2; if(idx>=tot)return;
+    int kl=idx&1; long r=idx>>1; int lane=r&31; long r2=r>>5; int g=r2%kg2, nb=r2/kg2, gid=lane>>2, t4=lane&3;
+    int k_tile=g*2+kl, k0=k_tile*16;
+    const uint16_t* wr = W + (size_t)(nb*8+gid)*K + k0;
+    long base = ((long)nb*kg2 + g)*256 + (long)lane*8 + kl*4;
+    wpr[base+0]=bf2half(wr[2*t4]);   wpr[base+1]=bf2half(wr[2*t4+1]);
+    wpr[base+2]=bf2half(wr[2*t4+8]); wpr[base+3]=bf2half(wr[2*t4+9]);
+}
+__global__ void tc_bf16_kernel(float* out, const __half* wpr, const __half* x16, int M, int N, int K){
+    int lane=threadIdx.x&31, gid=lane>>2, t4=lane&3;
+    int warp=threadIdx.x>>5; int n_block=blockIdx.x*WARPS+warp; if((long)n_block*8>=N) return; int n0=n_block*8;
+    float c[4]={0.f,0.f,0.f,0.f}; int kg2=K/32;
+    const __half* wb = wpr + (long)n_block*kg2*256;
+    const __half* xg0=x16+(size_t)gid*K, *xg8=x16+(size_t)(gid+8)*K;
+    bool m0=gid<M, m8=(gid+8)<M;
+    for(int g=0; g<kg2; ++g){
+        uint4 w8 = *(const uint4*)(wb + (long)g*256 + lane*8);   // 8 f16 = 2 k-tiles, 16B coalesced
+        const unsigned* wu=(const unsigned*)&w8;
+        #pragma unroll
+        for(int kl=0; kl<2; ++kl){ int k_tile=g*2+kl, k0=k_tile*16;
+            unsigned a[4];
+            a[0]=m0? *(const unsigned*)(xg0+k0+2*t4)   : 0u;
+            a[1]=m8? *(const unsigned*)(xg8+k0+2*t4)   : 0u;
+            a[2]=m0? *(const unsigned*)(xg0+k0+2*t4+8) : 0u;
+            a[3]=m8? *(const unsigned*)(xg8+k0+2*t4+8) : 0u;
+            unsigned bb[2]; bb[0]=wu[kl*2]; bb[1]=wu[kl*2+1];
+            mma_m16n8k16(c, a, bb);
+        }
+    }
+    int cn=2*t4;
+    if(gid<M   && n0+cn  <N) out[(size_t)gid*N   + n0+cn  ]=c[0];
+    if(gid<M   && n0+cn+1<N) out[(size_t)gid*N   + n0+cn+1]=c[1];
+    if(gid+8<M && n0+cn  <N) out[(size_t)(gid+8)*N + n0+cn ]=c[2];
+    if(gid+8<M && n0+cn+1<N) out[(size_t)(gid+8)*N + n0+cn+1]=c[3];
+}
+static std::unordered_map<const void*, __half*> g_bf16_cache;
+extern "C" void tc_bf16_gemm(float* out, const void* W_bf16, const void* x16, int M, int N, int K, cudaStream_t s){
+    auto it=g_bf16_cache.find(W_bf16); __half* wpr;
+    if(it==g_bf16_cache.end()){
+        cudaMalloc(&wpr,(size_t)N*K*sizeof(__half));
+        k_tc_bf16_repack<<<(unsigned)(((long)(N/8)*(K/32)*32*2+255)/256),256>>>(wpr,(const uint16_t*)W_bf16,N,K);
+        cudaDeviceSynchronize(); g_bf16_cache[W_bf16]=wpr;
+    } else wpr=it->second;
+    tc_bf16_kernel<<<(unsigned)((N/8+WARPS-1)/WARPS), WARPS*32, 0, s>>>(out, wpr, (const __half*)x16, M, N, K);
+}
