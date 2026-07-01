@@ -11,4 +11,8 @@ void mega_qkv(float* q, float* k, float* v, const float* h, const uint16_t* g,
               const uint8_t* kp, const uint8_t* ks, float kwg,
               const uint8_t* vp, const uint8_t* vs, float vwg,
               int H, int qd, int kd, float eps, cudaStream_t s);
+// M2: fused o_proj + post_attention_norm + residual (h += post_norm(o_proj(ao))).
+void mega_oproj(float* hres, const float* ao, const uint16_t* g,
+                const uint8_t* op_p, const uint8_t* op_s, float owg,
+                int H, int qd, float eps, cudaStream_t s);
 }

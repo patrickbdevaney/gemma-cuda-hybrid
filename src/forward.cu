@@ -543,9 +543,16 @@ static void attention_cached(Model& m, Session& S, float* h, int mtok, int base,
     k_store_kv<<<(mtok*kd+255)/256,256>>>(S.Vc[L], v, mtok, nkv, hd);
     int shmem=(2*hd+ (hd>256?hd:256))*4; dim3 grid(mtok,NHEAD);
     sdpa_cache_kernel<<<grid,hd,shmem>>>(ao, q, S.Kc[L], S.Vc[L], mtok, nkv, NHEAD, hd, is_full(L)?0:SWIN, 1.0f);   // reads g_base
+    if(MEGA && mtok==1 && !W4A4_TAPS){   // M2: fused o_proj + post_attn_norm + residual
+        std::string o_=P+"self_attn.o_proj";
+        mega_oproj(h, ao, m.dptr<const uint16_t*>(P+"post_attention_layernorm.weight"),
+            m.dptr<uint8_t*>(o_+".weight_packed"), m.dptr<uint8_t*>(o_+".weight_scale"), m.scalarF32(o_+".weight_global_scale"),
+            H, qd, EPS, 0);
+    } else {
     linear(m, op, ao, P+"self_attn.o_proj", mtok, H, qd);
     rmsnorm(op, op, m.dptr<const uint16_t*>(P+"post_attention_layernorm.weight"), mtok, H, EPS, 0);
     add_inplace(h, op, mtok*H, 0);   // no sync: all on stream 0, ordered
+    }
     if(big){ CU(cudaDeviceSynchronize()); for(auto p:tf)cudaFree(p); }
 }
 

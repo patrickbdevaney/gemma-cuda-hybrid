@@ -63,6 +63,41 @@ __global__ void mega_qkv_kernel(float* q,float* k,float* v,
     }
 }
 
+// M2: fused o_proj + post_attn_norm + residual. GRID-BARRIER class (produce all op, then reduce+add).
+// Launched with NB = resident-capacity blocks so the arrival barrier can't deadlock.
+__global__ void mega_oproj_kernel(float* hres,const float* ao,const uint16_t* g,
+    __half* ao16,float* op,int* cnt,const uint8_t* op_p,const uint8_t* op_s,float owi,int H,int qd,float eps,int NB){
+    int tid=threadIdx.x, lane=tid&31, warp=tid>>5, wpb=blockDim.x>>5;
+    if(blockIdx.x==0){                                   // Phase 0: convert ao -> ao16 (producer)
+        for(int i=tid;i<qd;i+=blockDim.x) ao16[i]=__float2half(ao[i]);
+        __threadfence(); if(tid==0) atomicExch(&cnt[0],1);
+    }
+    if(tid==0){ while(*(volatile int*)&cnt[0]==0){} } __syncthreads(); __threadfence();
+    for(long n=(long)blockIdx.x*wpb+warp; n<H; n+=(long)gridDim.x*wpb){    // Phase A: op = Wo·ao16 (all blocks)
+        float r=mega_dot(op_p,op_s,owi,ao16,(int)n,qd,lane); if(lane==0) op[n]=r;
+    }
+    __syncthreads(); __threadfence();
+    if(tid==0) atomicAdd(&cnt[1],1);                     // arrival barrier
+    if(blockIdx.x==0){                                   // Phase B: block0 reduces op -> rinv, then residual add
+        if(tid==0){ while(*(volatile int*)&cnt[1]<NB){} } __syncthreads(); __threadfence();
+        __shared__ float ss[256]; float loc=0.f;
+        for(int i=tid;i<H;i+=blockDim.x){ float x=op[i]; loc+=x*x; }
+        ss[tid]=loc; __syncthreads();
+        for(int s=blockDim.x/2;s>0;s>>=1){ if(tid<s)ss[tid]+=ss[tid+s]; __syncthreads(); }
+        float rinv=rsqrtf(ss[0]/H+eps);
+        for(int i=tid;i<H;i+=blockDim.x) hres[i]+=op[i]*rinv*mbf2f(g[i]);
+    }
+}
+extern "C" void mega_oproj(float* hres,const float* ao,const uint16_t* g,
+    const uint8_t* op_p,const uint8_t* op_s,float owg,int H,int qd,float eps,cudaStream_t s){
+    static __half* ao16=nullptr; static float* op=nullptr; static int* cnt=nullptr; static int NB=0;
+    if(!ao16){ MCU(cudaMalloc(&ao16,(size_t)16384*sizeof(__half))); MCU(cudaMalloc(&op,(size_t)16384*4)); MCU(cudaMalloc(&cnt,2*sizeof(int)));
+        int maxb=0; cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb,mega_oproj_kernel,256,0);
+        cudaDeviceProp p; cudaGetDeviceProperties(&p,0); NB=maxb*p.multiProcessorCount; if(NB<1)NB=20; }
+    MCU(cudaMemsetAsync(cnt,0,2*sizeof(int),s));
+    mega_oproj_kernel<<<NB,256,0,s>>>(hres,ao,g,ao16,op,cnt,op_p,op_s,1.f/owg,H,qd,eps,NB);
+}
+
 extern "C" void mega_qkv(float* q,float* k,float* v,const float* h,const uint16_t* g,
     const uint8_t* qp,const uint8_t* qs,float qwg,
     const uint8_t* kp,const uint8_t* ks,float kwg,

@@ -104,3 +104,14 @@ Baseline: base 44 tok/s (~29% of ~152 roofline), DFlash 84.3. Champion metric pe
 ## and the launch-overhead win is already captured by the graph. Aligns with research (MPK MoE = only 1.16x). A
 ## multi-week full build would plausibly reach base ~48-52 / DFlash ~90-98 - close to but NOT clearly past 100, and
 ## NOT the base 3x that >100-on-base would need. M1 (break-even, bit-exact, flag-gated) stands as the proven foundation.
+
+## === M2 BUILT + MEASURED (o_proj+post_norm+residual, grid-barrier, NB=100=5blk/SM) ===
+## VERIFIED BIT-EXACT (M1+M2 tokens == champion). Speed: M1+M2 = 44.07 vs champion 44.75 = -1.5%.
+## => M1 alone break-even, M2 adds slight regression. Grid-barrier penalty is REAL but SMALLER than predicted
+## (NB=100 not 40; o_proj at 100 blocks < champion's 352 -> mild concurrency loss + arrival-barrier + block0-reduce).
+## DECISIVE FINDING: per-unit megakernels (SEPARATE launches, just internally fused) do NOT win - M1 0%, M2 -1.5%,
+## trend negative. The research's win (Hazy 2.5x) is the FULL-STEP SINGLE persistent kernel with CROSS-OP WEIGHT
+## PREFETCH (load op N+1 weights during op N compute) - which per-unit separate kernels STRUCTURALLY CANNOT have.
+## To win, ALL ops must live in ONE persistent kernel (weeks-long instruction-interpreter build). Measured expected
+## payoff still ~1.0-1.2x for M=1-graphed -> base ~48-52 / DFlash ~90-98, NOT >100 on base. M1+M2 stand as the proven,
+## bit-exact foundation + the measured evidence that only the full single-kernel could win (uncertain, weeks).
