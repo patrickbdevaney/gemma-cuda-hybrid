@@ -320,6 +320,45 @@ __global__ void k_moe_down(float* out,const __half* hbuf,const int* ids,const fl
     if(lane==0){ out[(size_t)t*H+d0]=acc0; out[(size_t)t*H+d0+1]=acc1; }
 }
 
+// BANDWIDTH-OPTIMAL down: warp per (expert e, d0-pair). Read Wd_e[d0],Wd_e[d0+1] ONCE, reuse across ALL tokens
+// routing to e (weight-resident) -> hits the HBM floor (no ~1.5x per-token weight re-read). Writes per-assignment
+// partials dpart[(t*8+j)*H + d] (NO atomics). dg dequant applied here; routing weight ws applied in finalize.
+__global__ void k_moe_down_bw(float* dpart,const __half* hbuf,const int* ecount,const int* elist,int EL,
+    const uint8_t* const* dp,const uint8_t* const* ds,const float* dg,int H,int MI){
+    int lane=threadIdx.x&31; long widx=(long)blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5);
+    int dpr=widx%(H/2); int e=widx/(H/2); if(e>=128)return; int cnt=ecount[e]; if(cnt==0)return; int d0=dpr*2;
+    const unsigned* dpw0=(const unsigned*)(dp[e]+(size_t)d0*(MI/2)); const uint8_t* dsw0=ds[e]+(size_t)d0*(MI/16);
+    const unsigned* dpw1=(const unsigned*)(dp[e]+(size_t)(d0+1)*(MI/2)); const uint8_t* dsw1=ds[e]+(size_t)(d0+1)*(MI/16);
+    float dinv=1.f/dg[e]; int nu=MI/8;
+    for(int base=0;base<cnt;base+=4){ int nb=cnt-base; if(nb>4)nb=4;
+        float a0[4]={0,0,0,0},a1[4]={0,0,0,0}; const __half* hp[4]; int tj[4];
+        for(int c=0;c<nb;++c){ tj[c]=elist[e*EL+base+c]; hp[c]=hbuf+(size_t)tj[c]*MI; }
+        for(int vi=lane;vi<nu;vi+=32){ int k=vi*8;
+            unsigned wd0=__ldcs(&dpw0[vi]); float sc0=C_LUT[__ldcs(&dsw0[k>>4])]*dinv;   // WEIGHT read ONCE per vi
+            unsigned wd1=__ldcs(&dpw1[vi]); float sc1=C_LUT[__ldcs(&dsw1[k>>4])]*dinv;
+            const unsigned char* wb0=(const unsigned char*)&wd0; const unsigned char* wb1=(const unsigned char*)&wd1;
+            __half2 d0a=dec_fp4x2(wb0[0]),d0b=dec_fp4x2(wb0[1]),d0c=dec_fp4x2(wb0[2]),d0d=dec_fp4x2(wb0[3]);
+            __half2 d1a=dec_fp4x2(wb1[0]),d1b=dec_fp4x2(wb1[1]),d1c=dec_fp4x2(wb1[2]),d1d=dec_fp4x2(wb1[3]);
+            for(int c=0;c<nb;++c){ uint4 hpk=*(const uint4*)(hp[c]+k); const __half2* h=(const __half2*)&hpk;
+                __half2 s0=__hadd2(__hadd2(__hmul2(d0a,h[0]),__hmul2(d0b,h[1])),__hadd2(__hmul2(d0c,h[2]),__hmul2(d0d,h[3])));
+                __half2 s1=__hadd2(__hadd2(__hmul2(d1a,h[0]),__hmul2(d1b,h[1])),__hadd2(__hmul2(d1c,h[2]),__hmul2(d1d,h[3])));
+                a0[c]+=sc0*(__half2float(__low2half(s0))+__half2float(__high2half(s0)));
+                a1[c]+=sc1*(__half2float(__low2half(s1))+__half2float(__high2half(s1))); } }
+        for(int c=0;c<nb;++c){
+            #pragma unroll
+            for(int o=16;o>0;o>>=1){ a0[c]+=__shfl_down_sync(0xffffffffu,a0[c],o); a1[c]+=__shfl_down_sync(0xffffffffu,a1[c],o); }
+            if(lane==0){ dpart[(size_t)tj[c]*H+d0]=a0[c]; dpart[(size_t)tj[c]*H+d0+1]=a1[c]; } }
+    }
+}
+// finalize: out[t][d] = sum_{j=0..7} ws[t][j] * dpart[(t*8+j)*H + d]   (cheap 8-way reduce per output)
+__global__ void k_moe_finalize(float* out,const float* dpart,const float* ws,int mtok,int H){
+    long idx=(long)blockIdx.x*256+threadIdx.x; if(idx>=(long)mtok*H)return; int t=idx/H,d=idx%H;
+    float acc=0;
+    #pragma unroll
+    for(int j=0;j<8;++j) acc+=ws[(size_t)t*8+j]*dpart[(size_t)(t*8+j)*H+d];
+    out[idx]=acc;
+}
+
 // device pointer arrays for one layer's 128 experts (indexable by device top-8 id)
 struct ExpertPtrs { const uint8_t **gp,**gs,**up,**us,**dp,**ds; float *gg,*ug,*dg; };
 
@@ -396,7 +435,7 @@ static const int MAXM=16, QDMAX=16*512, KDMAX=16*512;
 struct DScratch {
     float *hmain,*hn,*q,*k,*v,*ao,*op,*dc,*ds;
     float *resid,*mi,*g,*u,*hs1,*x2,*moe_out,*scores,*top8_w,*sc1; int* top8_ids; int* dids;
-    float *hl,*dlog,*hln,*lg2,*aq,*tprob; int* darg,*ecount,*elist; __half *xh16,*hbuf,*x2_16;
+    float *hl,*dlog,*hln,*lg2,*aq,*tprob,*dpart; int* darg,*ecount,*elist; __half *xh16,*hbuf,*x2_16;
     DScratch(){ auto A=[&](float*&p,size_t n){ CU(cudaMalloc(&p,n*4)); };
         CU(cudaMalloc(&xh16,(size_t)MAXM*8192*sizeof(__half)));  // fp16 activation scratch: M=1 GEMV[K] or M<=16 GEMM[M,K]
         CU(cudaMalloc(&aq,(size_t)MAXM*8192*4));  // W4A4-emulation activation round-trip scratch
@@ -406,7 +445,8 @@ struct DScratch {
         A(dc,MAXM*256);A(ds,MAXM*256);A(resid,MAXM*H);A(mi,MAXM*H);A(g,MAXM*MLP_INT);A(u,MAXM*MLP_INT);A(hs1,MAXM*H);
         A(x2,MAXM*H);A(moe_out,MAXM*H);A(scores,MAXM*128);A(top8_w,MAXM*8);A(sc1,MAXM);
         CU(cudaMalloc(&top8_ids,MAXM*8*4)); CU(cudaMalloc(&dids,MAXM*4));
-        CU(cudaMalloc(&ecount,128*4)); CU(cudaMalloc(&elist,128*16*4)); CU(cudaMalloc(&tprob,MAXM*4)); }
+        CU(cudaMalloc(&ecount,128*4)); CU(cudaMalloc(&elist,128*16*4)); CU(cudaMalloc(&tprob,MAXM*4));
+        CU(cudaMalloc(&dpart,(size_t)MAXM*8*H*4)); }   // per-assignment down partials (bandwidth-optimal down)
 };
 static DScratch* DS;
 
@@ -542,6 +582,10 @@ static void moe(Model& m, float* h, int seq, int L){
         k_moe_gateup_grouped<<<(unsigned)((128*MOE_INT+7)/8),256>>>(hbuf, x2_16, DS->ecount, DS->elist, 16, ep->gp,ep->gs,ep->gg, ep->up,ep->us,ep->ug, H, MOE_INT);
     } else
     k_moe_gateup<<<(unsigned)((seq*TOPK*MOE_INT+7)/8),256>>>(hbuf, x2_16, top8_ids, ep->gp,ep->gs,ep->gg, ep->up,ep->us,ep->ug, seq, H, MOE_INT);
+    if(seq>1 && seq<=16){   // BANDWIDTH-OPTIMAL down: weight-resident (reuse each expert weight across its tokens) + per-assignment partials (no atomics) + cheap finalize
+        k_moe_down_bw<<<(unsigned)((128*(H/2)+7)/8),256>>>(DS->dpart, hbuf, DS->ecount, DS->elist, 16, ep->dp,ep->ds,ep->dg, H, MOE_INT);
+        k_moe_finalize<<<(unsigned)((seq*H+255)/256),256>>>(moe_out, DS->dpart, top8_w, seq, H);
+    } else
     k_moe_down<<<(unsigned)((seq*(H/2)+7)/8),256>>>(moe_out, hbuf, top8_ids, top8_w, ep->dp,ep->ds,ep->dg, seq, H, MOE_INT);
     rmsnorm(moe_out,moe_out,m.dptr<const uint16_t*>(P+"post_feedforward_layernorm_2.weight"),seq,H,EPS,0);
     add_inplace(hs1, moe_out, seq*H, 0);

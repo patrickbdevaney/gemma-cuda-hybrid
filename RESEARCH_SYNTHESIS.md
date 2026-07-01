@@ -42,3 +42,14 @@ Megakernel: deferred (1.0-1.7x vs tuned; MoE forces dynamic scheduling; draft+ve
   3. attention: FP8 KV (halve KV bytes), GQA head-stacking. memory-bound.
   This is per-kernel bandwidth tuning (multi-session), the honest path to ~2x -> matching/beating vLLM given our
   BETTER draft (tau 13 vs 7.84) + FP4 lm_head. NOT graph, NOT TC.
+
+## BUILD: bandwidth-optimal down (2026-07-01) — first bandwidth-MoE win
+- k_moe_down_bw: warp-per-(e,d-pair), read Wd_e[d] ONCE, reuse across ALL tokens routing to e (register-block 4),
+  write per-assignment partials dpart[(t*8+j)*H+d] (NO atomics) + k_moe_finalize (8-way ws-weighted sum per token).
+  Reuses gateup's invert map (ecount/elist). Fixes the ~1.5x per-token weight re-read of the old warp-per-(t,d) down.
+- RESULT: DFlash 82 -> 84.3 (+2.8%), gate PASS. Smaller than the 2.7x roofline -> the down is PARTLY compute-bound
+  (per-element dec_fp4x2 + half2 FMA competes with the weight stream), not purely weight-read-bound. The dedup
+  (weight-once) captured ~1.5x on the READS but compute limits the net. gateup already reuses weight (grouped).
+- NEXT bandwidth levers: (a) reduce per-element decode overhead / overlap loads (cp.async double-buffer — conflicting
+  research on batch-1); (b) apply weight-once to any remaining per-token kernels; (c) FP8 KV for attention bytes.
+  Each is ~+2-5%; stacking across kernels is the path to ~2x. This build is the validated template.
