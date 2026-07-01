@@ -32,6 +32,7 @@ Purpose-built pure-CUDA NVFP4 + DFlash spec-decode server for `google/gemma-4-26
 **WON (banked):** NVFP4 lm_head (+35%); bandwidth-down MoE (+2.8%); MoE C_LUT→HW cvt (+0.5%); **route lm_heads through tc (+9.7%)**; **16-byte int4 + __ldcs evict-first (+3.5%)**; tc weight prefetch U=8 (+1.9%); tc grid-fill WARPS=1 + no-shared-A (+3%); tc offline repack (+1.6%); MoE gateup+down U=4 prefetch (+5%); dense TC raw-mma in-register dequant (+3.3%); head-pack attn (+0.6% short-ctx).
 **LOST (reverted, don't retry):** draft→FP4 AND draft→FP8 (both collapse acceptance 13.33→11.14 — the bf16 draft IS the moat); cp.async on the *base M=1 gateup* (SMEM overhead > register gain at M=1); fp4_gemv/gateup 128-bit widen (per-EXPERT FP4 ptrs not 16B-aligned — but the lm_head EMBED buffer IS, that's why 16B works there); grid-cooperative megakernel (grid-barrier too expensive for M=1 tiny ops); TC grouped MoE (128-tile padding waste at ~2 tok/expert); full-step megakernel per-unit (barrier overhead); FP4 verify lm_head vs bf16 k_lmhead_batched (neutral — bf16 already efficient block-per-vocab).
 **NEUTRAL:** lm_head via TC when replacing already-efficient bf16 (memory-bound); base gateup micro-tuning (U=8, launch_bounds — register wall).
+**LOST — cp.async pipeline on tc GEMM (2026-07-01, STAGES=2/3/4/6 ALL ~107 vs 108.3 __ldcs):** SoL shows 90.9% L1TEX scoreboard stall (mma waits for weight) — LOOKS like cp.async territory, but our MAX-GRID-FILL structure (1 warp/block, 32768 blocks for lm_head) hides the per-warp stall via BLOCK-level parallelism (SM switches to another resident block). Async win < shared-hop + pipeline-fill overhead (kg8=22 groups). Marlin cp.async is for FEW LARGE register-heavy blocks (warp-level hiding); wrong tool for many-tiny-blocks. Register-prefetch of int4 (UG) also regressed (register pressure). **__ldcs sequential int4 + max-grid-fill is champion; tc GEMM at structural limit ~108, 57% mem.** NOTE: pushing tc 57→90% mem = only ~+2% (tc weight ~1.1GB/step is small vs 123ms block); the +9.7% lm_head win was KERNEL EFFICIENCY (CUDA-core→tc), NOT memory %.
 **KEY META-LESSON:** several "LOST/NEUTRAL" verdicts were SHALLOW — the tc kernel was neutral on lm_head UNTIL it had repack+prefetch+16B, then routing the (w4a16 CUDA-core) draft lm_head through it was +9.7%. **Re-test dismissed levers after the kernel they'd use improves.**
 
 ## 5. BEST KERNEL PATTERNS (reusable, proven on Thor)
@@ -57,10 +58,11 @@ Purpose-built pure-CUDA NVFP4 + DFlash spec-decode server for `google/gemma-4-26
 - Commit each champion atomically with before/after in the message. Revert regressions/neutrals immediately.
 - Weight-repack caches keyed by src ptr; lazy on warm-up so CUDA-graph capture never sees a cudaMalloc.
 
-## 8. ROADMAP TO 157 (ordered by expected impact)
-1. **[NEXT] Full cp.async 5-stage tc pipeline** — tc = 35% of step at ~60% mem; Marlin shared multi-buffer + swizzle → ~90% = **~+15%**. Recipe in §5.2. Biggest single lever.
-2. **MoE small-batch** — 16-byte int4 + evict-first on gateup/down (audit per-expert alignment); consider BLOCK_SIZE_M-style tiling; the MoE is ~27% and its glue (invert/router) may rival the matmul at bs=1.
-3. **Draft is ~35% of step** — the draft linears (k_linear_bf16, bf16, 12%) could go FP8-weight IF acceptance holds (bf16 draft moat — test carefully, likely LOST); the draft attention/FC.
+## 8. ROADMAP TO 157 (ordered by expected impact) — REVISED after cp.async dead-end
+0. **cp.async tc pipeline: DONE, DEAD-END** (see §4 LOST). tc GEMM at structural limit ~108. Don't retry.
+1. **[NEXT] Draft bf16 TC GEMM** — draft is ~35% of step; draft linears `k_linear_bf16` (12%) are CUDA-core + LATENCY-BOUND (SoL 41% mem/21% compute, like the w4a16 lm_head was before tc). Build a `tc_bf16_gemm` (mma.sync.m16n8k16.f32.**bf16.bf16**.f32, NO dequant, repack weight) — same win pattern that gave the lm_head +9.7%. SAFE: draft numerics only affect PROPOSALS/tau, not output (verify corrects → bit-exact output guaranteed); but MUST check tau doesn't drop. Est +3-5%.
+2. **MoE small-batch** — gateup/down are ~27%; repack per-expert weights into aligned buffers (per-expert ptrs NOT 16B-aligned → the tc-style repack fixes alignment AND enables 16B int4). SoL-profile first (is it latency or the invert/router glue?).
+3. **Draft attention / draft FC** — the rest of the 35% draft cost.
 4. **Whole-step CUDA graph** coverage (~20% launch overhead in general; we're pure-CUDA so partial).
 5. **FP8 KV cache** (long-context; head-pack already cut KV 4x).
 6. Re-profile after each — the bottleneck moves (it was lm_head all along, not what earlier filtered profiles showed).
