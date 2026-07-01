@@ -35,10 +35,13 @@ __global__ void k_tc_repack_s(uint8_t* wsr, const uint8_t* ws, int N, int K){
     wsr[((long)n_block*kt + k_tile)*8 + g] = ws[(long)(n_block*8+g)*(K/16) + k_tile];
 }
 // ---- GEMM over repacked weight (coalesced 64B/warp/k-tile) ----
+#ifndef WARPS
+#define WARPS 1
+#endif
 __global__ void tc_w4a16_kernel(float* out, const uint8_t* wpr, const uint8_t* wsr, float wg_inv,
                                 const __half* x16, int M, int N, int K){
     int lane=threadIdx.x&31, gid=lane>>2, t4=lane&3;
-    int n_block=blockIdx.x, n0=n_block*8;
+    int warp=threadIdx.x>>5; int n_block=blockIdx.x*WARPS+warp; if((long)n_block*8>=N) return; int n0=n_block*8;
     float c[4]={0.f,0.f,0.f,0.f}; int kt=K/16;
     const uint8_t* wb = wpr + (long)n_block*kt*64;
     const uint8_t* sb = wsr + (long)n_block*kt*8;
@@ -76,5 +79,5 @@ extern "C" void tc_w4a16_gemm(float* out, const uint8_t* wp, const uint8_t* ws, 
         k_tc_repack_s<<<(unsigned)(((long)nb*kt*8+255)/256),256>>>(wsr,ws,N,K);
         cudaDeviceSynchronize(); g_tc_cache[(const void*)wp]={wpr,wsr};
     } else { wpr=it->second.first; wsr=it->second.second; }
-    tc_w4a16_kernel<<<(unsigned)(N/8), 32, 0, s>>>(out, wpr, wsr, 1.f/w_gscale, (const __half*)x16, M, N, K);
+    tc_w4a16_kernel<<<(unsigned)((N/8+WARPS-1)/WARPS), WARPS*32, 0, s>>>(out, wpr, wsr, 1.f/w_gscale, (const __half*)x16, M, N, K);
 }
