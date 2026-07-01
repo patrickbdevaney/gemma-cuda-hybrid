@@ -35,3 +35,11 @@ Baseline: base 44 tok/s (~29% of ~152 roofline), DFlash 84.3. Champion metric pe
 ##  D. DRAFT megakernel (5 layers, hand-writable per Hazy 7-instruction model) - the draft zenith.
 ##  E. FlashNorm: fold RMSNorm scale into next GEMM + fuse q/k-norm+RoPE (14.7% of layer per TRT-LLM). base norms 9%.
 ## Each is a multi-hour build. Champion: base 44.6 / DFlash 84.7. Roofline 137 (89 @65%) -> ~2x base headroom real.
+
+## iter4: lever A reconsidered - base is GRAPHED so fusion's launch-win is already captured (research: MoE DRAM
+## round-trip only ~0.5% of weight traffic) -> lever A NOT worth it for graphed base. Pivoted to kernel-BW tuning:
+## gateup 128-bit uint4 loads (research #5) -> CRASHED (misaligned: per-expert FP4 ptrs not 16B-aligned). Reverted.
+## => base gateup micro-tuning EXHAUSTED (prefetch neutral, C_LUT neutral, widen faults). warp-per-output at its
+## structural limit. Remaining base levers require RESTRUCTURE: cp.async producer/consumer (lever B, same alignment
+## care needed) or megakernel. Next: lever C (FP8 draft) - the user's draft-model focus, untried at FP8 (FP4 failed
+## on acceptance; FP8/E4M3 has less error -> may keep tau 13.3 while halving the bandwidth-bound FC bytes).
