@@ -80,3 +80,13 @@ Megakernel: deferred (1.0-1.7x vs tuned; MoE forces dynamic scheduling; draft+ve
 - HONEST MoE CONCLUSION: my half2 MoE is near its practical structure limit for ~2 tokens/expert. TC (padding),
   dedup (compute-bound), grouped (padding) all investigated -> none gives 2x. The MoE is NOT where the win is.
   Redirect remaining effort AWAY from the MoE to: lmhead BW (60.9%->higher), draft (bf16->FP4?), FP8 KV.
+
+## DRAFT->FP4 WEIGHTS (2026-07-01) — LOST, reverted (hurts our key advantage)
+- Quantized draft bf16 linear weights -> FP4 (W4A16 via w4a16_gemm, keeping fp16 acts). Reused k_quant infra.
+- RESULT: DFlash 84.3->75.1 AND accept 13.33->11.14 (both regressed). The FP4 draft weights make the draft
+  LESS accurate -> proposals shift -> acceptance drops back to pre-FP4-lmhead level (loses the consistency win);
+  and w4a16_gemm overhead hurts the small-N draft linears (qkv/o). Reverted. Draft weights MUST stay bf16.
+- KEY: our acceptance edge (tau 13.3) DEPENDS on the accurate bf16 draft. Don't quantize the draft body.
+  (only the draft lm_head benefits from FP4 — big N=VOCAB byte-bound + consistency with the FP4 verify lmhead.)
+- MoE (near limit), draft->FP4 (hurts acceptance), TC (padding), graph (7%) all now closed by measurement.
+  Remaining small/uncertain: lmhead BW push (60.9->higher), FP8 KV (attention ~1%). Hybrid banked at 84.3.
