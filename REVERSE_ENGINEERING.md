@@ -29,3 +29,21 @@
   checkpoint (compressed-tensors nvfp4) or a small vLLM lm_head patch. NOT pure-CUDA.
 - **(A, pure-CUDA, high effort):** add full-DFlash-step CUDA graph (draft has GROWING ctx -> device-seqlen refactor)
   + optionally a tcgen05 TC MoE, keeping the FP4 lm_head. Matches vLLM's system wins by hand. Multi-day, uncertain.
+
+## CORRECTION (controlled-ish comparison) — the gap is bigger + it's kernel efficiency
+- My server is WORKLOAD-DEPENDENT: 82 tok/s on short/easy primes (80 tok, tau 13.33) but **58 tok/s on longer/
+  harder primes (300 tok, tau 10.0)**. The 82 was an EASY-workload number.
+- vLLM = 100 tok/s on the 300-tok workload, tau **7.84** (per-position acceptance decays to 0 by pos 12).
+- Per-step: mine ~172ms, vLLM ~78ms -> **vLLM's kernels are ~2.2x faster per step**, only partly offset by MY
+  higher draft acceptance (10-13 vs 7.84). Net vLLM ~1.7x faster on comparable work.
+- ROOT CAUSE = vLLM's mature stack: flashinfer/cutlass FP4 TC GEMM + FULL CUDA graphs (whole step) + tuned
+  TRITON_ATTN + scheduler overlap. My hand-written half2 + partial-graph is ~2x behind per-step.
+- **My genuine edge that survives: draft acceptance is competitive-to-better, AND the FP4 lm_head (vLLM lacks it).**
+
+## Honest verdict + recommended path
+- Matching vLLM's per-step kernels in hand-written CUDA ≈ re-implementing flashinfer+cutlass+vLLM's graph system.
+  Not realistic in a reasonable timeframe. My 58-82 is a strong single-author pure-CUDA result but ~1.7x behind
+  a mature production stack.
+- **Fastest route to >110: add the NVFP4 lm_head to the vLLM stack** (its one untapped lever — bf16 lm_head is
+  ~1.5GB/step). vLLM 100 + lm_head byte-reduction -> plausibly 110-120. Leverages vLLM's mature kernels + my
+  proven lm_head win. This is path (b), inverted: bring MY win TO vLLM, not vLLM's deps to my server.
