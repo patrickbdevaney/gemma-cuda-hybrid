@@ -48,19 +48,24 @@ __global__ void tc_w4a16_kernel(float* out, const uint8_t* wpr, const uint8_t* w
     const __half* xg0 = x16 + (size_t)gid*K;
     const __half* xg8 = x16 + (size_t)(gid+8)*K;
     bool m0=gid<M, m8=(gid+8)<M;
-    for(int k_tile=0; k_tile<kt; ++k_tile){
-        int k0=k_tile*16;
-        unsigned a[4];
-        a[0]=m0? *(const unsigned*)(xg0+k0+2*t4)   : 0u;
-        a[1]=m8? *(const unsigned*)(xg8+k0+2*t4)   : 0u;
-        a[2]=m0? *(const unsigned*)(xg0+k0+2*t4+8) : 0u;
-        a[3]=m8? *(const unsigned*)(xg8+k0+2*t4+8) : 0u;
-        unsigned short w2 = *(const unsigned short*)(wb + (long)k_tile*64 + lane*2);   // coalesced
-        __half2 sc2 = __float2half2_rn(tcv_e4m3(sb[(long)k_tile*8 + gid]) * wg_inv);
-        __half2 b0 = __hmul2(tcv_fp4x2((uint8_t)(w2&0xFF)), sc2);
-        __half2 b1 = __hmul2(tcv_fp4x2((uint8_t)(w2>>8)),   sc2);
-        unsigned bb[2]; bb[0]=*(unsigned*)&b0; bb[1]=*(unsigned*)&b1;
-        mma_m16n8k16(c, a, bb);
+    const int U=4;   // software-pipelined weight prefetch: U coalesced loads before decode/mma -> more bytes-in-flight (60%->higher BW)
+    for(int kb=0; kb<kt; kb+=U){
+        unsigned short w2[U];
+        #pragma unroll
+        for(int u=0;u<U;++u){ int kt2=kb+u; if(kt2<kt) w2[u]=*(const unsigned short*)(wb + (long)kt2*64 + lane*2); }
+        #pragma unroll
+        for(int u=0;u<U;++u){ int k_tile=kb+u; if(k_tile>=kt) break; int k0=k_tile*16;
+            unsigned a[4];
+            a[0]=m0? *(const unsigned*)(xg0+k0+2*t4)   : 0u;
+            a[1]=m8? *(const unsigned*)(xg8+k0+2*t4)   : 0u;
+            a[2]=m0? *(const unsigned*)(xg0+k0+2*t4+8) : 0u;
+            a[3]=m8? *(const unsigned*)(xg8+k0+2*t4+8) : 0u;
+            __half2 sc2 = __float2half2_rn(tcv_e4m3(sb[(long)k_tile*8 + gid]) * wg_inv);
+            __half2 b0 = __hmul2(tcv_fp4x2((uint8_t)(w2[u]&0xFF)), sc2);
+            __half2 b1 = __hmul2(tcv_fp4x2((uint8_t)(w2[u]>>8)),   sc2);
+            unsigned bb[2]; bb[0]=*(unsigned*)&b0; bb[1]=*(unsigned*)&b1;
+            mma_m16n8k16(c, a, bb);
+        }
     }
     int cn=2*t4;
     if(gid<M   && n0+cn  <N) out[(size_t)gid*N   + n0+cn  ]=c[0];
