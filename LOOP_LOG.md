@@ -85,3 +85,9 @@ Baseline: base 44 tok/s (~29% of ~152 roofline), DFlash 84.3. Champion metric pe
 ## NEXT (M2): extend the SAME persistent kernel to also fold the q/k-norm+RoPE (warp-per-head restructure) and/or
 ## chain o_proj+post_norm+residual, amortizing the memset/spin over more fused work toward break-even, then M4
 ## cross-op prefetch for the actual speed win. Champion base 44.9 / DFlash 85 HELD (flag off).
+
+## M1-optimized (grid-sizing fix): mega_qkv now launches nblocks=(qd+2kd+7)/8 (~1 warp/output) instead of fixed 64
+## -> matches champion's per-GEMV concurrency/latency-hiding. RESULT: 44.5 vs champion 44.4 = BREAK-EVEN, bit-exact.
+## VALIDATES the megakernel approach: fusion overhead fully amortizes when grid is sized right. => each additional
+## fused op (M2+) should push POSITIVE (savings accumulate, no coordination penalty). Was -2% purely from block-count
+## under-provisioning, NOT fundamental. Trajectory is GO. Champion (flag off) 44.9 held.

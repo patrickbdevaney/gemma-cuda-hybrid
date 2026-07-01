@@ -71,7 +71,9 @@ extern "C" void mega_qkv(float* q,float* k,float* v,const float* h,const uint16_
     static __half* hnorm16=nullptr; static int* counter=nullptr;
     if(!hnorm16){ MCU(cudaMalloc(&hnorm16,(size_t)16384*sizeof(__half))); MCU(cudaMalloc(&counter,sizeof(int))); }
     MCU(cudaMemsetAsync(counter,0,sizeof(int),s));
-    mega_qkv_kernel<<<64,256,0,s>>>(q,k,v,h,g,hnorm16,counter,
+    int total_out = qd + kd + (vp? kd:0);
+    int nblocks = (total_out + 7)/8;   // 8 warps/block, ~1 output/warp -> match champion's per-GEMV concurrency (latency hiding)
+    mega_qkv_kernel<<<nblocks,256,0,s>>>(q,k,v,h,g,hnorm16,counter,
         qp,qs,1.f/qwg, kp,ks,1.f/kwg, vp,vp?vs:nullptr,vp?1.f/vwg:0.f, H,qd,kd,eps);
     if(!vp) MCU(cudaMemcpyAsync(v,k,(size_t)kd*sizeof(float),cudaMemcpyDeviceToDevice,s));  // full layer: v=k
 }
