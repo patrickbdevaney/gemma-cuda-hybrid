@@ -11,6 +11,7 @@
 #include <vector>
 #include <functional>
 #include <mutex>
+#include <random>
 #include "tokenizer.h"
 #include "third_party/httplib.h"
 // TEAL/CATS activation-sparsity probe (SPARSITY=1): per-row retained-L2-norm at each magnitude-threshold sparsity.
@@ -185,6 +186,24 @@ __global__ void k_argmax(int* out,const float* lg,int V){
     int p=blockIdx.x; __shared__ float sv[256]; __shared__ int si[256];
     float bv=-1e30f; int bi=0;
     for(int v=threadIdx.x;v<V;v+=256){ float x=lg[(size_t)p*V+v]; if(x>bv){bv=x;bi=v;} }
+    sv[threadIdx.x]=bv; si[threadIdx.x]=bi; __syncthreads();
+    for(int s=128;s>0;s>>=1){ if(threadIdx.x<s && sv[threadIdx.x+s]>sv[threadIdx.x]){sv[threadIdx.x]=sv[threadIdx.x+s];si[threadIdx.x]=si[threadIdx.x+s];} __syncthreads(); }
+    if(threadIdx.x==0) out[p]=si[0];
+}
+__device__ unsigned long long g_sample_seed=0ULL;   // per-step RNG seed for k_sample (updated like g_base for graph replay)
+__device__ __forceinline__ float hashu(unsigned long long x){   // splitmix64 -> uniform (0,1)
+    x+=0x9E3779B97F4A7C15ULL; x=(x^(x>>30))*0xBF58476D1CE4E5B9ULL; x=(x^(x>>27))*0x94D049BB133111EBULL; x^=x>>31;
+    return ((float)((x>>11))+0.5f)*(1.0f/9007199254740992.0f); }
+// LOSSLESS temperature sampling in spec-decode: sample target[pos] via Gumbel-max (argmax(logit*invT + gumbel)).
+// Accepting draft iff draft==this sample => every committed token is a genuine target sample; reduces to greedy at temp=0.
+__global__ void k_sample(int* out,const float* lg,int V,float invT){
+    int p=blockIdx.x; __shared__ float sv[256]; __shared__ int si[256];
+    unsigned long long base=g_sample_seed ^ ((unsigned long long)p*0x100000001B3ULL);
+    float bv=-1e30f; int bi=0;
+    for(int v=threadIdx.x;v<V;v+=256){
+        float u=hashu(base ^ ((unsigned long long)(unsigned)v*0x9E3779B1ULL));
+        float g=-logf(-logf(u+1e-20f)+1e-20f);
+        float s=lg[(size_t)p*V+v]*invT + g; if(s>bv){bv=s;bi=v;} }
     sv[threadIdx.x]=bv; si[threadIdx.x]=bi; __syncthreads();
     for(int s=128;s>0;s>>=1){ if(threadIdx.x<s && sv[threadIdx.x+s]>sv[threadIdx.x]){sv[threadIdx.x]=sv[threadIdx.x+s];si[threadIdx.x]=si[threadIdx.x+s];} __syncthreads(); }
     if(threadIdx.x==0) out[p]=si[0];
@@ -715,7 +734,8 @@ static int engine_prefill(Model& m, Session& S, const std::vector<int>& ids, flo
 // DFlash speculative generate. emit(token)->bool (false = caller wants to stop, e.g. client gone). Returns tokens generated.
 // stats optional: {steps, accepted_sum} written back. Extracted from main()'s DFlash loop VERBATIM.
 static int engine_generate_dflash(Model& m, Session& S, DraftModel* dm, float* taps_ctx, int k,
-        int first_tok, int max_new, float typEps, float invT, const std::function<bool(int)>& emit, int* out_steps=nullptr, int* out_acc=nullptr){
+        int first_tok, int max_new, float typEps, float invT, bool do_sample, unsigned long long seed0,
+        const std::function<bool(int)>& emit, int* out_steps=nullptr, int* out_acc=nullptr){
     float* taps_blk; CU(cudaMalloc(&taps_blk,(size_t)(k+1)*6*H*4));
     uint16_t* embed = m.dptr<uint16_t*>(EMBN);
     std::vector<int> draft_ids(k), allarg(k+1), ctxpos; std::vector<float> tprob(k);
@@ -729,7 +749,8 @@ static int engine_generate_dflash(Model& m, Session& S, DraftModel* dm, float* t
         rmsnorm(DS->hln, h, m.dptr<const uint16_t*>("model.language_model.norm.weight"), k+1, H, EPS, 0);
         k_f32_to_f16<<<((k+1)*H+255)/256,256>>>(DS->xh16, DS->hln, (k+1)*H);
         tc_w4a16_gemm(DS->lg2, g_ewp, g_ews, g_egs, DS->xh16, k+1, VOCAB, H, 0);
-        k_argmax<<<k+1,256>>>(DS->darg, DS->lg2, VOCAB);
+        if(do_sample) k_sample<<<k+1,256>>>(DS->darg, DS->lg2, VOCAB, invT);   // lossless temperature sampling (Gumbel-max); reads g_sample_seed
+        else k_argmax<<<k+1,256>>>(DS->darg, DS->lg2, VOCAB);
         if(typical) k_typical_prob<<<k,256>>>(DS->tprob, DS->lg2, DS->dids, VOCAB, invT);
     };
     bool vUseGraph=!getenv("NOGRAPH"); bool vCap=false; cudaGraph_t vg; cudaGraphExec_t vexec;
@@ -740,6 +761,8 @@ static int engine_generate_dflash(Model& m, Session& S, DraftModel* dm, float* t
         std::vector<int> blk; blk.reserve(k+1); blk.push_back(tok); for(int i=0;i<k;++i) blk.push_back(draft_ids[i]);
         CU(cudaMemcpyAsync(DS->dids, blk.data(), (k+1)*4, cudaMemcpyHostToDevice, cudaStreamPerThread));
         CU(cudaMemcpyToSymbolAsync(g_base, &S.valid_len, sizeof(int), 0, cudaMemcpyHostToDevice, cudaStreamPerThread));
+        if(do_sample){ unsigned long long ss=seed0 + (unsigned long long)steps*0x100000001B3ULL;
+            CU(cudaMemcpyToSymbolAsync(g_sample_seed, &ss, 8, 0, cudaMemcpyHostToDevice, cudaStreamPerThread)); }
         if(vUseGraph){
             if(!vCap){ verify_step(); CU(cudaStreamSynchronize(cudaStreamPerThread));
                 CU(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal)); verify_step();
@@ -806,14 +829,17 @@ static void run_server(const std::string& ckpt, int port){
         nlohmann::json j; try{ j=nlohmann::json::parse(req.body); }catch(...){ res.status=400; res.set_content("{\"error\":\"bad json\"}","application/json"); return; }
         auto msgs=parse_msgs(j); auto ids=tk.chat_prompt(msgs);
         int max_tokens=j.value("max_tokens",256); bool stream=j.value("stream",false);
+        float temperature=j.value("temperature",0.0f);   // top_p accepted but v1 applies temperature only (Gumbel-max); top_p=nucleus is a TODO
+        bool do_sample=temperature>0.f; float invT=1.f/(temperature>0.f?temperature:1.f);
+        std::random_device rd; unsigned long long seed0=((unsigned long long)rd()<<32)^(unsigned long long)rd();
         std::string cid="chatcmpl-thor";
         if(stream){
-            res.set_chunked_content_provider("text/event-stream",[&,ids,max_tokens,cid](size_t, httplib::DataSink& sink){
+            res.set_chunked_content_provider("text/event-stream",[&,ids,max_tokens,cid,do_sample,invT,seed0](size_t, httplib::DataSink& sink){
                 std::lock_guard<std::mutex> lk(g_serve_mtx);
                 S->valid_len=0; int t0=engine_prefill(m,*S,ids,taps_ctx);
                 std::string r0=sse_role(cid); sink.write(r0.data(),r0.size());
                 std::vector<int> gen; std::string prev;
-                engine_generate_dflash(m,*S,dm,taps_ctx,k,t0,max_tokens,0.f,1.f,[&](int t)->bool{
+                engine_generate_dflash(m,*S,dm,taps_ctx,k,t0,max_tokens,0.f,invT,do_sample,seed0,[&](int t)->bool{
                     if(tk.is_stop(t)) return false;
                     gen.push_back(t); std::string full=tk.decode(gen); std::string d=full.substr(prev.size()); prev=full;
                     if(!d.empty()){ std::string c=sse_delta(cid,d); if(!sink.write(c.data(),c.size())) return false; }
@@ -823,7 +849,7 @@ static void run_server(const std::string& ckpt, int port){
             std::lock_guard<std::mutex> lk(g_serve_mtx);
             S->valid_len=0; int t0=engine_prefill(m,*S,ids,taps_ctx);
             std::vector<int> gen; int st=0,ac=0;
-            engine_generate_dflash(m,*S,dm,taps_ctx,k,t0,max_tokens,0.f,1.f,[&](int t){ if(tk.is_stop(t))return false; gen.push_back(t); return true; },&st,&ac);
+            engine_generate_dflash(m,*S,dm,taps_ctx,k,t0,max_tokens,0.f,invT,do_sample,seed0,[&](int t){ if(tk.is_stop(t))return false; gen.push_back(t); return true; },&st,&ac);
             std::string text=tk.decode(gen);
             nlohmann::json out={{"id",cid},{"object","chat.completion"},{"model","gemma-4-26b-dflash"},
                 {"choices",{{{"index",0},{"message",{{"role","assistant"},{"content",text}}},{"finish_reason","stop"}}}},
@@ -949,10 +975,13 @@ int main(int argc,char**argv){
         int k = getenv("DK")?atoi(getenv("DK")):14; k=std::max(1,std::min(15,k));  // k=14 optimal (k-sweep)
         DraftModel* dm = draft_load((std::string(getenv("HOME"))+"/models/gemma-4-26B-A4B-DFlash/model.safetensors").c_str(), CAP+32);
         float typEps = getenv("TYP_EPS")?atof(getenv("TYP_EPS")):0.f;
-        float invT = 1.f/(getenv("TEMP")?atof(getenv("TEMP")):1.f);
+        float tempv = getenv("TEMP")?atof(getenv("TEMP")):1.f;
+        bool doSamp = getenv("SAMPLE")!=nullptr && tempv>0.f;   // greedy by default (champion); SAMPLE=1 TEMP=0.8 to sample
+        float invT = 1.f/(tempv>0.f?tempv:1.f);
+        unsigned long long seed0 = getenv("SEED")?strtoull(getenv("SEED"),0,10):1ULL;
         int steps=0, accepted_sum=0;
         cudaEventRecord(t0);
-        ngen = engine_generate_dflash(m,*S,dm,taps_ctx,k,tok,NGEN,typEps,invT,
+        ngen = engine_generate_dflash(m,*S,dm,taps_ctx,k,tok,NGEN,typEps,invT,doSamp,seed0,
                  [&](int t){ printf("%d ",t); fflush(stdout); return true; }, &steps, &accepted_sum);
         cudaEventRecord(t1); cudaEventSynchronize(t1); float ms=0; cudaEventElapsedTime(&ms,t0,t1);
         printf("\n[dflash decode %d tok in %.1f ms = %.2f tok/s | %d steps, mean accept %.2f drafts/block (k=%d), tau=%.2f]\n",
