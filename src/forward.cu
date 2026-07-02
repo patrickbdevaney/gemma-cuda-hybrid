@@ -787,6 +787,22 @@ static int engine_generate_dflash(Model& m, Session& S, DraftModel* dm, float* t
     return ngen;
 }
 
+// ---- Phase 2: prefix caching. Persist the token-ids in the KV; reuse the longest common prefix across requests. ----
+static std::vector<int> g_cached_ids;   // tokens currently valid in S->Kc/Vc (+taps_ctx); LCP-matched per request
+// Prefill with prefix reuse: LCP with the cache -> reprocess only the new suffix at base=p (KV[0:p) reused, bit-exact).
+static int engine_prefill_cached(Model& m, Session& S, const std::vector<int>& ids, float* taps_ctx, int* reused=nullptr){
+    int p=0, cmax=std::min((int)ids.size(),(int)g_cached_ids.size());
+    while(p<cmax && ids[p]==g_cached_ids[p]) ++p;
+    if(p>=(int)ids.size()) p=(int)ids.size()-1;   // must reprocess >=1 token for its next-token logits
+    if(p<0) p=0;
+    if(reused)*reused=p;
+    std::vector<int> suffix(ids.begin()+p, ids.end());
+    std::vector<float> logits;
+    forward_block(m,S,suffix,p,logits,taps_ctx+(size_t)p*6*H,nullptr,nullptr);   // g_base=p -> KV/taps written at [p,len)
+    S.valid_len=(int)ids.size();
+    g_cached_ids=ids;
+    int b=0; for(int i=1;i<VOCAB;++i) if(logits[i]>logits[b])b=i; return b;
+}
 // ---- Phase 1c: OpenAI-compatible HTTP server (pure C++ single binary, cpp-httplib) ----
 static std::mutex g_serve_mtx;   // serialize GPU access: one request at a time (single-instance engine)
 static std::string sse_role(const std::string& cid){
@@ -836,7 +852,8 @@ static void run_server(const std::string& ckpt, int port){
         if(stream){
             res.set_chunked_content_provider("text/event-stream",[&,ids,max_tokens,cid,do_sample,invT,seed0](size_t, httplib::DataSink& sink){
                 std::lock_guard<std::mutex> lk(g_serve_mtx);
-                S->valid_len=0; int t0=engine_prefill(m,*S,ids,taps_ctx);
+                int reused=0; int t0=engine_prefill_cached(m,*S,ids,taps_ctx,&reused);
+                fprintf(stderr,"[prefix-cache] reused %d/%zu prompt tokens\n",reused,ids.size());
                 std::string r0=sse_role(cid); sink.write(r0.data(),r0.size());
                 std::vector<int> gen; std::string prev;
                 engine_generate_dflash(m,*S,dm,taps_ctx,k,t0,max_tokens,0.f,invT,do_sample,seed0,[&](int t)->bool{
@@ -847,7 +864,8 @@ static void run_server(const std::string& ckpt, int port){
                 std::string e=sse_stop(cid); sink.write(e.data(),e.size()); sink.done(); return true; });
         } else {
             std::lock_guard<std::mutex> lk(g_serve_mtx);
-            S->valid_len=0; int t0=engine_prefill(m,*S,ids,taps_ctx);
+            int reused=0; int t0=engine_prefill_cached(m,*S,ids,taps_ctx,&reused);
+            fprintf(stderr,"[prefix-cache] reused %d/%zu prompt tokens\n",reused,ids.size());
             std::vector<int> gen; int st=0,ac=0;
             engine_generate_dflash(m,*S,dm,taps_ctx,k,t0,max_tokens,0.f,invT,do_sample,seed0,[&](int t){ if(tk.is_stop(t))return false; gen.push_back(t); return true; },&st,&ac);
             std::string text=tk.decode(gen);
