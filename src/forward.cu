@@ -9,6 +9,7 @@
 #include "draft.h"
 #include <algorithm>
 #include <vector>
+#include <functional>
 // TEAL/CATS activation-sparsity probe (SPARSITY=1): per-row retained-L2-norm at each magnitude-threshold sparsity.
 static void measure_sparsity(const __half* dev, int rows, int dim, const char* name){
     std::vector<__half> h((size_t)rows*dim);
@@ -672,6 +673,94 @@ static void dump_h(float* h,int seq,int idx){
     if(!DUMP)return; std::vector<float> hh((size_t)seq*H); CU(cudaMemcpy(hh.data(),h,(size_t)seq*H*4,cudaMemcpyDeviceToHost));
     char p[128]; snprintf(p,128,"/tmp/cudahs/hs_%d.bin",idx); FILE* f=fopen(p,"wb"); fwrite(hh.data(),4,hh.size(),f); fclose(f);
 }
+static const char* EMBN="model.language_model.embed_tokens.weight";
+// forward a block of mtok tokens at [base,base+mtok); updates KV; fills lo(logits of last)/allarg(per-pos argmax)/ftok(argmax) as requested.
+// Extracted from main()'s run-lambda VERBATIM so the benchmark and the server share one code path (Phase 1b engine refactor).
+static void forward_block(Model& m, Session& S, const std::vector<int>& nids,int base,std::vector<float>& lo,float* taps,std::vector<int>* allarg,int* ftok){
+    int mtok=nids.size(); bool big=mtok>MAXM;
+    int* dids; float* h;
+    if(big){ CU(cudaMalloc(&dids,mtok*4)); CU(cudaMalloc(&h,(size_t)mtok*H*4)); } else { dids=DS->dids; h=DS->hmain; }
+    CU(cudaMemcpyAsync(dids,nids.data(),mtok*4,cudaMemcpyHostToDevice));
+    CU(cudaMemcpyToSymbol(g_base,&base,sizeof(int)));
+    k_embed<<<mtok,256>>>(h, m.dptr<const uint16_t*>(EMBN), dids, mtok, H, EMB_SCALE);
+    static double t_layers=0,t_head=0; bool prof=getenv("PROF");
+    cudaEvent_t a,b,c; if(prof){cudaEventCreate(&a);cudaEventCreate(&b);cudaEventCreate(&c);cudaDeviceSynchronize();cudaEventRecord(a);}
+    for(int L=0;L<NLAYER;++L){ attention_cached(m,S,h,mtok,base,L); moe(m,h,mtok,L);
+        if(taps){ int j=tap_slot(L); if(j>=0) k_tap<<<(mtok*H+255)/256,256>>>(taps,h,mtok,j,H); } }
+    if(prof){cudaEventRecord(b);}
+    rmsnorm(DS->hl, h+(size_t)(mtok-1)*H, m.dptr<const uint16_t*>("model.language_model.norm.weight"),1,H,EPS,0);
+    k_f32_to_f16<<<(H+255)/256,256>>>(DS->xh16, DS->hl, H);
+    fp4_gemv(DS->dlog, g_ewp, g_ews, g_egs, DS->xh16, VOCAB, H, 0);
+    if(ftok){ k_argmax<<<1,256>>>(DS->darg, DS->dlog, VOCAB); CU(cudaMemcpy(ftok,DS->darg,4,cudaMemcpyDeviceToHost)); }
+    else { CU(cudaDeviceSynchronize()); lo.resize(VOCAB); CU(cudaMemcpy(lo.data(),DS->dlog,(size_t)VOCAB*4,cudaMemcpyDeviceToHost)); }
+    if(prof){cudaEventRecord(c);cudaEventSynchronize(c);float ab,bc;cudaEventElapsedTime(&ab,a,b);cudaEventElapsedTime(&bc,b,c);t_layers+=ab;t_head+=bc;
+        fprintf(stderr,"[prof] layers=%.1fms head=%.1fms (cum layers=%.0f head=%.0f)\n",ab,bc,t_layers,t_head);}
+    if(allarg){ allarg->resize(mtok);
+        rmsnorm(DS->hln,h,m.dptr<const uint16_t*>("model.language_model.norm.weight"),mtok,H,EPS,0);
+        k_lmhead_batched<<<VOCAB,256,(size_t)H*4>>>(DS->lg2,DS->hln,m.dptr<const uint16_t*>(EMBN),H,VOCAB,mtok);
+        k_argmax<<<mtok,256>>>(DS->darg,DS->lg2,VOCAB); CU(cudaDeviceSynchronize());
+        CU(cudaMemcpy(allarg->data(),DS->darg,mtok*4,cudaMemcpyDeviceToHost)); }
+    if(big){ cudaFree(dids);cudaFree(h); }
+}
+// prefill the prompt: forward + set valid_len + return first generated token (greedy). out_logits optional (for top-5).
+static int engine_prefill(Model& m, Session& S, const std::vector<int>& ids, float* taps_ctx, std::vector<float>* out_logits=nullptr){
+    std::vector<float> logits; forward_block(m,S,ids,0,logits,taps_ctx,nullptr,nullptr); S.valid_len=ids.size();
+    int b=0; for(int i=1;i<VOCAB;++i) if(logits[i]>logits[b])b=i;
+    if(out_logits)*out_logits=std::move(logits);
+    return b;
+}
+// DFlash speculative generate. emit(token)->bool (false = caller wants to stop, e.g. client gone). Returns tokens generated.
+// stats optional: {steps, accepted_sum} written back. Extracted from main()'s DFlash loop VERBATIM.
+static int engine_generate_dflash(Model& m, Session& S, DraftModel* dm, float* taps_ctx, int k,
+        int first_tok, int max_new, float typEps, float invT, const std::function<bool(int)>& emit, int* out_steps=nullptr, int* out_acc=nullptr){
+    float* taps_blk; CU(cudaMalloc(&taps_blk,(size_t)(k+1)*6*H*4));
+    uint16_t* embed = m.dptr<uint16_t*>(EMBN);
+    std::vector<int> draft_ids(k), allarg(k+1), ctxpos; std::vector<float> tprob(k);
+    bool typical = typEps>0.f;
+    int ngen=0, steps=0, accepted_sum=0, tok=first_tok;
+    auto verify_step=[&](){
+        k_embed<<<k+1,256>>>(DS->hmain, embed, DS->dids, k+1, H, EMB_SCALE);
+        float* h=DS->hmain;
+        for(int L=0;L<NLAYER;++L){ attention_cached(m,S,h,k+1,0,L); moe(m,h,k+1,L);
+            int j=tap_slot(L); if(j>=0) k_tap<<<((k+1)*H+255)/256,256>>>(taps_blk,h,k+1,j,H); }
+        rmsnorm(DS->hln, h, m.dptr<const uint16_t*>("model.language_model.norm.weight"), k+1, H, EPS, 0);
+        k_f32_to_f16<<<((k+1)*H+255)/256,256>>>(DS->xh16, DS->hln, (k+1)*H);
+        tc_w4a16_gemm(DS->lg2, g_ewp, g_ews, g_egs, DS->xh16, k+1, VOCAB, H, 0);
+        k_argmax<<<k+1,256>>>(DS->darg, DS->lg2, VOCAB);
+        if(typical) k_typical_prob<<<k,256>>>(DS->tprob, DS->lg2, DS->dids, VOCAB, invT);
+    };
+    bool vUseGraph=!getenv("NOGRAPH"); bool vCap=false; cudaGraph_t vg; cudaGraphExec_t vexec;
+    bool stop=false;
+    while(ngen<max_new && !stop){
+        ctxpos.resize(S.valid_len); for(int i=0;i<S.valid_len;++i) ctxpos[i]=i;
+        draft_propose(dm, taps_ctx, ctxpos.data(), S.valid_len, tok, embed, embed, g_ewp, g_ews, g_egs, draft_ids.data(), k);
+        std::vector<int> blk; blk.reserve(k+1); blk.push_back(tok); for(int i=0;i<k;++i) blk.push_back(draft_ids[i]);
+        CU(cudaMemcpyAsync(DS->dids, blk.data(), (k+1)*4, cudaMemcpyHostToDevice, cudaStreamPerThread));
+        CU(cudaMemcpyToSymbolAsync(g_base, &S.valid_len, sizeof(int), 0, cudaMemcpyHostToDevice, cudaStreamPerThread));
+        if(vUseGraph){
+            if(!vCap){ verify_step(); CU(cudaStreamSynchronize(cudaStreamPerThread));
+                CU(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal)); verify_step();
+                CU(cudaStreamEndCapture(cudaStreamPerThread,&vg)); CU(cudaGraphInstantiate(&vexec,vg,0)); vCap=true; }
+            else CU(cudaGraphLaunch(vexec,cudaStreamPerThread));
+        } else verify_step();
+        CU(cudaMemcpyAsync(allarg.data(), DS->darg, (k+1)*4, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+        if(typical) CU(cudaMemcpyAsync(tprob.data(), DS->tprob, k*4, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+        CU(cudaStreamSynchronize(cudaStreamPerThread));
+        int na=0; if(typical){ for(int i=0;i<k;++i){ if(tprob[i]>=typEps) na++; else break; } }
+                  else       { for(int i=0;i<k;++i){ if(draft_ids[i]==allarg[i]) na++; else break; } }
+        int newbonus = allarg[na];
+        if(!emit(tok)){ stop=true; } ngen++;
+        if(!stop) stop = (tok==1||tok==106);
+        for(int i=0;i<na && ngen<max_new && !stop;++i){ if(!emit(draft_ids[i])){stop=true;break;} ngen++; stop=(draft_ids[i]==1||draft_ids[i]==106); }
+        CU(cudaMemcpy(taps_ctx+(size_t)S.valid_len*6*H, taps_blk, (size_t)(na+1)*6*H*4, cudaMemcpyDeviceToDevice));
+        S.valid_len += 1+na; tok = newbonus; steps++; accepted_sum += na;
+    }
+    if(vCap){ cudaGraphExecDestroy(vexec); cudaGraphDestroy(vg); }
+    cudaFree(taps_blk);
+    if(out_steps)*out_steps=steps; if(out_acc)*out_acc=accepted_sum;
+    return ngen;
+}
+
 int main(int argc,char**argv){
     if(getenv("DUMP")) DUMP=true; system("mkdir -p /tmp/cudahs");
     std::string ckpt = argc>1?argv[1]:std::string(getenv("HOME"))+"/models/gemma-4-26B-A4B-it-NVFP4/model.safetensors";
@@ -782,60 +871,15 @@ int main(int argc,char**argv){
         cudaEventRecord(t1); cudaEventSynchronize(t1); float ms=0; cudaEventElapsedTime(&ms,t0,t1);
         printf("\n[base decode %d tok in %.1f ms = %.2f tok/s]\n", ngen, ms, ngen*1000.0/ms);
     } else {
-        // ---- DFlash speculative decode (k drafts/block) ----
+        // ---- DFlash speculative decode via the reusable engine_generate_dflash (shared with the server) ----
         int k = getenv("DK")?atoi(getenv("DK")):14; k=std::max(1,std::min(15,k));  // k=14 optimal (k-sweep)
         DraftModel* dm = draft_load((std::string(getenv("HOME"))+"/models/gemma-4-26B-A4B-DFlash/model.safetensors").c_str(), CAP+32);
-        uint16_t* embed = m.dptr<uint16_t*>(embn);
-        float* taps_blk; CU(cudaMalloc(&taps_blk,(size_t)(k+1)*6*H*4));
-        std::vector<int> draft_ids(k), allarg, ctxpos;
+        float typEps = getenv("TYP_EPS")?atof(getenv("TYP_EPS")):0.f;
+        float invT = 1.f/(getenv("TEMP")?atof(getenv("TEMP")):1.f);
         int steps=0, accepted_sum=0;
-        float typEps = getenv("TYP_EPS")?atof(getenv("TYP_EPS")):0.f;   // Medusa typical acceptance (T>0); 0 = exact greedy
-        float invT = 1.f/(getenv("TEMP")?atof(getenv("TEMP")):1.f); bool typical = typEps>0.f;
-        std::vector<float> tprob(k);
-        // verify forward (fixed M=k+1) as a CUDA graph: reads DS->dids (block) + g_base, writes taps_blk + DS->darg
-        auto verify_step=[&](){
-            k_embed<<<k+1,256>>>(DS->hmain, embed, DS->dids, k+1, H, EMB_SCALE);
-            float* h=DS->hmain;
-            for(int L=0;L<NLAYER;++L){ attention_cached(m,*S,h,k+1,0,L); moe(m,h,k+1,L);
-                int j=tap_slot(L); if(j>=0) k_tap<<<((k+1)*H+255)/256,256>>>(taps_blk,h,k+1,j,H); }
-            rmsnorm(DS->hln, h, m.dptr<const uint16_t*>("model.language_model.norm.weight"), k+1, H, EPS, 0);
-            k_f32_to_f16<<<((k+1)*H+255)/256,256>>>(DS->xh16, DS->hln, (k+1)*H);   // fp16 hidden for half2 lmhead
-            tc_w4a16_gemm(DS->lg2, g_ewp, g_ews, g_egs, DS->xh16, k+1, VOCAB, H, 0);   // NVFP4 verify lm_head (4x lighter)
-            k_argmax<<<k+1,256>>>(DS->darg, DS->lg2, VOCAB);
-            if(typical) k_typical_prob<<<k,256>>>(DS->tprob, DS->lg2, DS->dids, VOCAB, invT);
-        };
-        bool vUseGraph=!getenv("NOGRAPH"); bool vCap=false; cudaGraph_t vg; cudaGraphExec_t vexec;
-        allarg.resize(k+1);
         cudaEventRecord(t0);
-        while(ngen<NGEN){
-            ctxpos.resize(S->valid_len); for(int i=0;i<S->valid_len;++i) ctxpos[i]=i;
-            draft_propose(dm, taps_ctx, ctxpos.data(), S->valid_len, tok, embed, embed, g_ewp, g_ews, g_egs, draft_ids.data(), k);
-            std::vector<int> block; block.reserve(k+1); block.push_back(tok);
-            for(int i=0;i<k;++i) block.push_back(draft_ids[i]);
-            CU(cudaMemcpyAsync(DS->dids, block.data(), (k+1)*4, cudaMemcpyHostToDevice, cudaStreamPerThread));
-            CU(cudaMemcpyToSymbolAsync(g_base, &S->valid_len, sizeof(int), 0, cudaMemcpyHostToDevice, cudaStreamPerThread));
-            if(vUseGraph){
-                if(!vCap){ verify_step(); CU(cudaStreamSynchronize(cudaStreamPerThread));   // step0 eager (lazy init) + capture
-                    CU(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal)); verify_step();
-                    CU(cudaStreamEndCapture(cudaStreamPerThread,&vg)); CU(cudaGraphInstantiate(&vexec,vg,0)); vCap=true; }
-                else CU(cudaGraphLaunch(vexec,cudaStreamPerThread));
-            } else verify_step();
-            CU(cudaMemcpyAsync(allarg.data(), DS->darg, (k+1)*4, cudaMemcpyDeviceToHost, cudaStreamPerThread));
-            if(typical) CU(cudaMemcpyAsync(tprob.data(), DS->tprob, k*4, cudaMemcpyDeviceToHost, cudaStreamPerThread));
-            CU(cudaStreamSynchronize(cudaStreamPerThread));   // verify done; allarg[0..k], taps_blk[0..k] ready
-            if(getenv("DBG_DRAFT")){ static int d2=0; if(!d2){ d2=1; FILE* f=fopen("/tmp/dbg_target.txt","w");
-                for(int i=0;i<=k;++i) fprintf(f,"%d ",allarg[i]); fprintf(f,"\n"); fclose(f); } }
-            // exact greedy: accept iff draft==argmax.  typical (T>0): accept iff target prob(draft) >= eps (accepts near-misses)
-            int na=0; if(typical){ for(int i=0;i<k;++i){ if(tprob[i]>=typEps) na++; else break; } }
-                      else       { for(int i=0;i<k;++i){ if(draft_ids[i]==allarg[i]) na++; else break; } }
-            int newbonus = allarg[na];
-            printf("%d ",tok); fflush(stdout); ngen++;
-            bool stop = (tok==1||tok==106);
-            for(int i=0;i<na && ngen<NGEN && !stop;++i){ printf("%d ",draft_ids[i]); ngen++; stop=(draft_ids[i]==1||draft_ids[i]==106); }
-            CU(cudaMemcpy(taps_ctx+(size_t)S->valid_len*6*H, taps_blk, (size_t)(na+1)*6*H*4, cudaMemcpyDeviceToDevice));
-            S->valid_len += 1+na; tok = newbonus; steps++; accepted_sum += na;
-            if(stop) break;
-        }
+        ngen = engine_generate_dflash(m,*S,dm,taps_ctx,k,tok,NGEN,typEps,invT,
+                 [&](int t){ printf("%d ",t); fflush(stdout); return true; }, &steps, &accepted_sum);
         cudaEventRecord(t1); cudaEventSynchronize(t1); float ms=0; cudaEventElapsedTime(&ms,t0,t1);
         printf("\n[dflash decode %d tok in %.1f ms = %.2f tok/s | %d steps, mean accept %.2f drafts/block (k=%d), tau=%.2f]\n",
                ngen, ms, ngen*1000.0/ms, steps, steps?(double)accepted_sum/steps:0, k, steps?(double)ngen/steps:0);
