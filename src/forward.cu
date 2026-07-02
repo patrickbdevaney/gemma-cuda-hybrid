@@ -14,6 +14,7 @@
 #include <random>
 #include "tokenizer.h"
 #include "third_party/httplib.h"
+#include "webui.h"
 // TEAL/CATS activation-sparsity probe (SPARSITY=1): per-row retained-L2-norm at each magnitude-threshold sparsity.
 static void measure_sparsity(const __half* dev, int rows, int dim, const char* name){
     std::vector<__half> h((size_t)rows*dim);
@@ -870,6 +871,7 @@ static void run_server(const std::string& ckpt, int port){
     Tokenizer tk; { std::string d=ckpt; auto p=d.rfind('/'); tk.load((p==std::string::npos?std::string("."):d.substr(0,p))+"/tokenizer.json"); }
     printf("[server] model+draft+tokenizer loaded (vocab=%zu). OpenAI API on http://0.0.0.0:%d/v1/chat/completions\n",tk.vocab.size(),port); fflush(stdout);
     httplib::Server svr;
+    svr.Get("/",[&](const httplib::Request&,httplib::Response& r){ r.set_content(WEBUI_HTML,"text/html"); });
     svr.Get("/v1/models",[&](const httplib::Request&,httplib::Response& r){ r.set_content("{\"object\":\"list\",\"data\":[{\"id\":\"gemma-4-26b-dflash\",\"object\":\"model\"}]}","application/json"); });
     svr.Post("/v1/chat/completions",[&](const httplib::Request& req, httplib::Response& res){
         nlohmann::json j; try{ j=nlohmann::json::parse(req.body); }catch(...){ res.status=400; res.set_content("{\"error\":\"bad json\"}","application/json"); return; }

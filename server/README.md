@@ -21,3 +21,15 @@ KV size + dtype are launch-config (the "dynamic reset" interface — set per run
   branch on the flag; Session allocs 1B/elem (fp8) or 2B/elem (bf16). Verified coherent at 64K FP8 ("Paris"; fruit list).
 - Memory @64K FP8 ≈ 7GB KV + 4.3GB taps + 16GB model (fits). All layers alloc full CAP (sliding-window ring buffer
   = future optimization to shrink the 25 sliding layers to SWIN=1024). Runtime /admin resize endpoint = future work.
+
+## Phase 4: clients + reasoning/thinking delineation
+- **WebUI** at `GET /` — self-contained single-file (no CDN/build, works offline): streaming, live compact-markdown
+  (code blocks w/ copy + lang, headers/lists/quotes/bold/inline), collapsible **Thinking** blocks (reasoning_content),
+  settings (system prompt, temperature, max_tokens, show-thinking), tok/s stats, new-chat, stop. Dark modern theme.
+- **Terminal** `build/chat [host] [port]` (g++ -I include server/chat.cpp -o build/chat -lpthread): pure-C++
+  streaming REPL, multi-turn, dimmed 🤔 thinking, tok/s. Env THINK=1 / TEMP=0.8.
+- **Reasoning delineation**: ChanRouter parses gemma-4 <|channel>thought..<channel|> -> reasoning_content vs content
+  (streaming reasoning_content deltas + non-stream field), enable_thinking / reasoning_effort / chat_template_kwargs.
+  Full SGLang/vLLM reasoning-parser parity. (gemma-4-A4B-it emits empty thoughts; infra ready for CoT models.)
+- **TODO (tool calling)**: parse <|tool_call>call:name{args}<tool_call|> -> OpenAI tool_calls, and format request
+  `tools` into the gemma tool prompt. Tokens known (48/49); the gemma arg-format + jinja tool-macro replication is the work.
