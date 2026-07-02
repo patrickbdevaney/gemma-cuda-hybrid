@@ -817,6 +817,29 @@ static std::string sse_delta(const std::string& cid,const std::string& d){
     nlohmann::json j={{"id",cid},{"object","chat.completion.chunk"},{"model","gemma-4-26b-dflash"},
         {"choices",{{{"index",0},{"delta",{{"content",d}}},{"finish_reason",nullptr}}}}};
     return "data: "+j.dump()+"\n\n"; }
+static std::string sse_reason(const std::string& cid,const std::string& d){   // reasoning_content delta (vLLM/DeepSeek convention)
+    nlohmann::json j={{"id",cid},{"object","chat.completion.chunk"},{"model","gemma-4-26b-dflash"},
+        {"choices",{{{"index",0},{"delta",{{"reasoning_content",d}}},{"finish_reason",nullptr}}}}};
+    return "data: "+j.dump()+"\n\n"; }
+// routes generated tokens to content vs reasoning via gemma-4 channel state (<|channel>thought..<channel|>answer),
+// decoding each stream separately for correct UTF-8. Also strips the channel-name + control tokens.
+struct ChanRouter {
+    Tokenizer* tk; int state=0;   // 0=content, 1=reading channel-name, 2=inside thought channel
+    std::vector<int> cid_, rid_; std::string cprev, rprev;
+    bool feed(int t, std::string& cd, std::string& rd){   // false => stop token
+        cd.clear(); rd.clear();
+        if(t==tk->chan_start){ state=1; return true; }
+        if(state==1){ if(t==107) state=2; return true; }         // skip channel name up to '\n'
+        if(t==tk->chan_end){ state=0; return true; }
+        if(tk->is_stop(t)) return false;
+        if(state==2){ rid_.push_back(t); std::string f=tk->decode(rid_); rd=f.substr(rprev.size()); rprev=f; }
+        else        { cid_.push_back(t); std::string f=tk->decode(cid_); cd=f.substr(cprev.size()); cprev=f; }
+        return true;
+    }
+    std::string content(){ return tk->decode(cid_); }
+    std::string reasoning(){ return tk->decode(rid_); }
+    int n_content(){ return (int)cid_.size(); }
+};
 static std::string sse_stop(const std::string& cid){
     nlohmann::json j={{"id",cid},{"object","chat.completion.chunk"},{"model","gemma-4-26b-dflash"},
         {"choices",{{{"index",0},{"delta",nlohmann::json::object()},{"finish_reason","stop"}}}}};
@@ -850,9 +873,12 @@ static void run_server(const std::string& ckpt, int port){
     svr.Get("/v1/models",[&](const httplib::Request&,httplib::Response& r){ r.set_content("{\"object\":\"list\",\"data\":[{\"id\":\"gemma-4-26b-dflash\",\"object\":\"model\"}]}","application/json"); });
     svr.Post("/v1/chat/completions",[&](const httplib::Request& req, httplib::Response& res){
         nlohmann::json j; try{ j=nlohmann::json::parse(req.body); }catch(...){ res.status=400; res.set_content("{\"error\":\"bad json\"}","application/json"); return; }
-        auto msgs=parse_msgs(j); auto ids=tk.chat_prompt(msgs);
+        auto msgs=parse_msgs(j);
+        bool think = j.value("enable_thinking",false) || (j.contains("chat_template_kwargs")&&j["chat_template_kwargs"].value("enable_thinking",false))
+                     || (j.contains("reasoning_effort")&&j["reasoning_effort"].is_string()&&j["reasoning_effort"].get<std::string>()!="none");
+        auto ids=tk.chat_prompt(msgs,think);
         int max_tokens=j.value("max_tokens",256); bool stream=j.value("stream",false);
-        float temperature=j.value("temperature",0.0f);   // top_p accepted but v1 applies temperature only (Gumbel-max); top_p=nucleus is a TODO
+        float temperature=j.value("temperature",0.0f);   // top_p accepted; v1 applies temperature only (Gumbel-max)
         bool do_sample=temperature>0.f; float invT=1.f/(temperature>0.f?temperature:1.f);
         std::random_device rd; unsigned long long seed0=((unsigned long long)rd()<<32)^(unsigned long long)rd();
         std::string cid="chatcmpl-thor";
@@ -862,23 +888,24 @@ static void run_server(const std::string& ckpt, int port){
                 int reused=0; int t0=engine_prefill_cached(m,*S,ids,taps_ctx,&reused);
                 fprintf(stderr,"[prefix-cache] reused %d/%zu prompt tokens\n",reused,ids.size());
                 std::string r0=sse_role(cid); sink.write(r0.data(),r0.size());
-                std::vector<int> gen; std::string prev;
+                ChanRouter rt{&tk, think?2:0}; bool alive=true;
                 engine_generate_dflash(m,*S,dm,taps_ctx,k,t0,max_tokens,0.f,invT,do_sample,seed0,[&](int t)->bool{
-                    if(tk.is_stop(t)) return false;
-                    gen.push_back(t); std::string full=tk.decode(gen); std::string d=full.substr(prev.size()); prev=full;
-                    if(!d.empty()){ std::string c=sse_delta(cid,d); if(!sink.write(c.data(),c.size())) return false; }
+                    std::string cd,rd; if(!rt.feed(t,cd,rd)) return false;
+                    if(!rd.empty()){ std::string c=sse_reason(cid,rd); if(!sink.write(c.data(),c.size())){alive=false;return false;} }
+                    if(!cd.empty()){ std::string c=sse_delta(cid,cd);  if(!sink.write(c.data(),c.size())){alive=false;return false;} }
                     return true; });
                 std::string e=sse_stop(cid); sink.write(e.data(),e.size()); sink.done(); return true; });
         } else {
             std::lock_guard<std::mutex> lk(g_serve_mtx);
             int reused=0; int t0=engine_prefill_cached(m,*S,ids,taps_ctx,&reused);
             fprintf(stderr,"[prefix-cache] reused %d/%zu prompt tokens\n",reused,ids.size());
-            std::vector<int> gen; int st=0,ac=0;
-            engine_generate_dflash(m,*S,dm,taps_ctx,k,t0,max_tokens,0.f,invT,do_sample,seed0,[&](int t){ if(tk.is_stop(t))return false; gen.push_back(t); return true; },&st,&ac);
-            std::string text=tk.decode(gen);
+            ChanRouter rt{&tk, think?2:0}; int st=0,ac=0, ntok=0;
+            engine_generate_dflash(m,*S,dm,taps_ctx,k,t0,max_tokens,0.f,invT,do_sample,seed0,[&](int t){ std::string cd,rd; ntok++; return rt.feed(t,cd,rd); },&st,&ac);
+            nlohmann::json msg={{"role","assistant"},{"content",rt.content()}};
+            std::string reason=rt.reasoning(); if(!reason.empty()) msg["reasoning_content"]=reason;
             nlohmann::json out={{"id",cid},{"object","chat.completion"},{"model","gemma-4-26b-dflash"},
-                {"choices",{{{"index",0},{"message",{{"role","assistant"},{"content",text}}},{"finish_reason","stop"}}}},
-                {"usage",{{"prompt_tokens",(int)ids.size()},{"completion_tokens",(int)gen.size()},{"total_tokens",(int)(ids.size()+gen.size())}}}};
+                {"choices",{{{"index",0},{"message",msg},{"finish_reason","stop"}}}},
+                {"usage",{{"prompt_tokens",(int)ids.size()},{"completion_tokens",ntok},{"total_tokens",(int)ids.size()+ntok}}}};
             res.set_content(out.dump(),"application/json");
         }
     });

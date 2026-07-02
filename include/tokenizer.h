@@ -47,14 +47,16 @@ struct Tokenizer {
         if(ce!=vocab.end()) chan_end=ce->second;
         stop_ids={eos_id, turn_end}; auto tr=vocab.find("<|tool_response>"); if(tr!=vocab.end()) stop_ids.push_back(tr->second);
     }
-    // gemma-4 chat prompt (single or multi turn). msgs = [(role,content)]; role in {system,user,model/assistant}.
-    std::vector<int> chat_prompt(const std::vector<std::pair<std::string,std::string>>& msgs){
+    // gemma-4 chat prompt. msgs=[(role,content)]. enable_thinking: false pre-fills an empty thought channel
+    // (straight to answer, fast); true lets the model reason in <|channel>thought..<channel|> (parsed to reasoning_content).
+    std::vector<int> chat_prompt(const std::vector<std::pair<std::string,std::string>>& msgs, bool enable_thinking=false){
         std::vector<int> ids={bos_id};
         for(auto& m : msgs){ std::string role = (m.first=="assistant")?"model":m.first;
             ids.push_back(turn_start); encode_text(role+"\n",ids); encode_text(m.second,ids); ids.push_back(turn_end); encode_text("\n",ids); }
         ids.push_back(turn_start); encode_text("model\n",ids);   // generation prompt
-        ids.push_back(chan_start); encode_text("thought\n",ids); ids.push_back(chan_end);  // non-thinking: pre-fill empty thought channel -> straight to answer
-        return ids;
+        ids.push_back(chan_start); encode_text("thought\n",ids);        // open thought channel
+        if(!enable_thinking) ids.push_back(chan_end);                    // OFF: close immediately (empty thought -> straight to answer)
+        return ids;                                                      // ON: leave open -> model reasons inside until it emits <channel|>
     }
     bool is_stop(int id){ for(int s:stop_ids) if(id==s) return true; return false; }
     // BPE a normalized (spaces already ▁) plain segment
