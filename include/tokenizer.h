@@ -16,6 +16,7 @@ struct Tokenizer {
     std::unordered_map<uint64_t, std::pair<int,int>> merges;// (idA,idB) -> (rank, mergedId)
     std::vector<std::pair<std::string,int>> specials;       // (content,id), matched literally before BPE
     int eos_id=1, bos_id=2, turn_start=105, turn_end=106;   // gemma-4: <|turn>=105, <turn|>=106
+    int chan_start=100, chan_end=101;                        // <|channel>=100, <channel|>=101
     std::vector<int> stop_ids;                               // generation stops: <eos>, <turn|>, <|tool_response>=50
 
     static uint64_t pk(int a,int b){ return ((uint64_t)(uint32_t)a<<32)|(uint32_t)(uint32_t)b; }
@@ -41,6 +42,9 @@ struct Tokenizer {
         auto ts=vocab.find("<|turn>"), te=vocab.find("<turn|>");   // gemma-4 turn markers (in main vocab, not added_tokens)
         if(ts!=vocab.end()) turn_start=ts->second;
         if(te!=vocab.end()) turn_end=te->second;
+        auto cs=vocab.find("<|channel>"), ce=vocab.find("<channel|>");
+        if(cs!=vocab.end()) chan_start=cs->second;
+        if(ce!=vocab.end()) chan_end=ce->second;
         stop_ids={eos_id, turn_end}; auto tr=vocab.find("<|tool_response>"); if(tr!=vocab.end()) stop_ids.push_back(tr->second);
     }
     // gemma-4 chat prompt (single or multi turn). msgs = [(role,content)]; role in {system,user,model/assistant}.
@@ -49,6 +53,7 @@ struct Tokenizer {
         for(auto& m : msgs){ std::string role = (m.first=="assistant")?"model":m.first;
             ids.push_back(turn_start); encode_text(role+"\n",ids); encode_text(m.second,ids); ids.push_back(turn_end); encode_text("\n",ids); }
         ids.push_back(turn_start); encode_text("model\n",ids);   // generation prompt
+        ids.push_back(chan_start); encode_text("thought\n",ids); ids.push_back(chan_end);  // non-thinking: pre-fill empty thought channel -> straight to answer
         return ids;
     }
     bool is_stop(int id){ for(int s:stop_ids) if(id==s) return true; return false; }
@@ -97,7 +102,7 @@ struct Tokenizer {
             if(s.size()==6 && s[0]=='<'&&s[1]=='0'&&s[2]=='x'&&s[5]=='>'){   // <0xXX> -> raw byte (fuse)
                 auto hx=[](char c){ return c<='9'?c-'0':(c|32)-'a'+10; };
                 out.push_back((char)((hx(s[3])<<4)|hx(s[4]))); continue; }
-            if(skip_special && !s.empty() && s[0]=='<' && (s=="<bos>"||s=="<eos>"||s=="<pad>"||s.rfind("<start_of_turn>",0)==0||s.rfind("<end_of_turn>",0)==0)) continue;
+            if(skip_special && s.size()>=3 && s[0]=='<' && (s[1]=='|' || s[s.size()-2]=='|' || s=="<bos>"||s=="<eos>"||s=="<pad>")) continue;  // gemma-4 control tokens <|X> / <X|>
             for(size_t k=0;k<s.size();){ if(k+2<s.size()&&(unsigned char)s[k]==0xE2&&(unsigned char)s[k+1]==0x96&&(unsigned char)s[k+2]==0x81){ out.push_back(' '); k+=3; }
                 else { out.push_back(s[k]); ++k; } }
         }

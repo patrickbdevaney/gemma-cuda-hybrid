@@ -10,6 +10,9 @@
 #include <algorithm>
 #include <vector>
 #include <functional>
+#include <mutex>
+#include "tokenizer.h"
+#include "third_party/httplib.h"
 // TEAL/CATS activation-sparsity probe (SPARSITY=1): per-row retained-L2-norm at each magnitude-threshold sparsity.
 static void measure_sparsity(const __half* dev, int rows, int dim, const char* name){
     std::vector<__half> h((size_t)rows*dim);
@@ -761,12 +764,83 @@ static int engine_generate_dflash(Model& m, Session& S, DraftModel* dm, float* t
     return ngen;
 }
 
+// ---- Phase 1c: OpenAI-compatible HTTP server (pure C++ single binary, cpp-httplib) ----
+static std::mutex g_serve_mtx;   // serialize GPU access: one request at a time (single-instance engine)
+static std::string sse_role(const std::string& cid){
+    nlohmann::json j={{"id",cid},{"object","chat.completion.chunk"},{"model","gemma-4-26b-dflash"},
+        {"choices",{{{"index",0},{"delta",{{"role","assistant"}}},{"finish_reason",nullptr}}}}};
+    return "data: "+j.dump()+"\n\n"; }
+static std::string sse_delta(const std::string& cid,const std::string& d){
+    nlohmann::json j={{"id",cid},{"object","chat.completion.chunk"},{"model","gemma-4-26b-dflash"},
+        {"choices",{{{"index",0},{"delta",{{"content",d}}},{"finish_reason",nullptr}}}}};
+    return "data: "+j.dump()+"\n\n"; }
+static std::string sse_stop(const std::string& cid){
+    nlohmann::json j={{"id",cid},{"object","chat.completion.chunk"},{"model","gemma-4-26b-dflash"},
+        {"choices",{{{"index",0},{"delta",nlohmann::json::object()},{"finish_reason","stop"}}}}};
+    return "data: "+j.dump()+"\n\ndata: [DONE]\n\n"; }
+static std::vector<std::pair<std::string,std::string>> parse_msgs(const nlohmann::json& j){
+    std::vector<std::pair<std::string,std::string>> msgs;
+    if(j.contains("messages")) for(auto& mm:j["messages"]){ std::string role=mm.value("role","user"), content;
+        if(mm.contains("content")){ if(mm["content"].is_string()) content=mm["content"].get<std::string>();
+            else if(mm["content"].is_array()) for(auto& p:mm["content"]) if(p.contains("text")) content+=p["text"].get<std::string>(); }
+        msgs.push_back({role,content}); }
+    return msgs; }
+static void run_server(const std::string& ckpt, int port){
+    Model m(ckpt);
+    SC=new Scratch(); DS=new DScratch(); init_clut(); Session* S=new Session();
+    { const uint16_t* embp=m.dptr<const uint16_t*>(EMBN);   // quantize tied embed -> NVFP4 lm_head (same as benchmark setup)
+      CU(cudaMalloc(&g_ewp,(size_t)VOCAB*(H/2))); CU(cudaMalloc(&g_ews,(size_t)VOCAB*(H/16)));
+      float* d_amax; CU(cudaMalloc(&d_amax,4)); CU(cudaMemset(d_amax,0,4));
+      k_embed_amax<<<1024,256>>>(embp,(long)VOCAB*H,d_amax);
+      float h_amax; CU(cudaMemcpy(&h_amax,d_amax,4,cudaMemcpyDeviceToHost)); g_egs=2688.f/h_amax;
+      k_quant_embed_fp4<<<(unsigned)(((long)VOCAB*(H/16)+255)/256),256>>>(embp,g_ewp,g_ews,H,VOCAB,g_egs);
+      CU(cudaDeviceSynchronize()); CU(cudaFree(d_amax)); }
+    int k=getenv("DK")?atoi(getenv("DK")):14; k=std::max(1,std::min(15,k));
+    DraftModel* dm=draft_load((std::string(getenv("HOME"))+"/models/gemma-4-26B-A4B-DFlash/model.safetensors").c_str(), CAP+32);
+    float* taps_ctx; CU(cudaMalloc(&taps_ctx,(size_t)(CAP+32)*6*H*4));
+    Tokenizer tk; { std::string d=ckpt; auto p=d.rfind('/'); tk.load((p==std::string::npos?std::string("."):d.substr(0,p))+"/tokenizer.json"); }
+    printf("[server] model+draft+tokenizer loaded (vocab=%zu). OpenAI API on http://0.0.0.0:%d/v1/chat/completions\n",tk.vocab.size(),port); fflush(stdout);
+    httplib::Server svr;
+    svr.Get("/v1/models",[&](const httplib::Request&,httplib::Response& r){ r.set_content("{\"object\":\"list\",\"data\":[{\"id\":\"gemma-4-26b-dflash\",\"object\":\"model\"}]}","application/json"); });
+    svr.Post("/v1/chat/completions",[&](const httplib::Request& req, httplib::Response& res){
+        nlohmann::json j; try{ j=nlohmann::json::parse(req.body); }catch(...){ res.status=400; res.set_content("{\"error\":\"bad json\"}","application/json"); return; }
+        auto msgs=parse_msgs(j); auto ids=tk.chat_prompt(msgs);
+        int max_tokens=j.value("max_tokens",256); bool stream=j.value("stream",false);
+        std::string cid="chatcmpl-thor";
+        if(stream){
+            res.set_chunked_content_provider("text/event-stream",[&,ids,max_tokens,cid](size_t, httplib::DataSink& sink){
+                std::lock_guard<std::mutex> lk(g_serve_mtx);
+                S->valid_len=0; int t0=engine_prefill(m,*S,ids,taps_ctx);
+                std::string r0=sse_role(cid); sink.write(r0.data(),r0.size());
+                std::vector<int> gen; std::string prev;
+                engine_generate_dflash(m,*S,dm,taps_ctx,k,t0,max_tokens,0.f,1.f,[&](int t)->bool{
+                    if(tk.is_stop(t)) return false;
+                    gen.push_back(t); std::string full=tk.decode(gen); std::string d=full.substr(prev.size()); prev=full;
+                    if(!d.empty()){ std::string c=sse_delta(cid,d); if(!sink.write(c.data(),c.size())) return false; }
+                    return true; });
+                std::string e=sse_stop(cid); sink.write(e.data(),e.size()); sink.done(); return true; });
+        } else {
+            std::lock_guard<std::mutex> lk(g_serve_mtx);
+            S->valid_len=0; int t0=engine_prefill(m,*S,ids,taps_ctx);
+            std::vector<int> gen; int st=0,ac=0;
+            engine_generate_dflash(m,*S,dm,taps_ctx,k,t0,max_tokens,0.f,1.f,[&](int t){ if(tk.is_stop(t))return false; gen.push_back(t); return true; },&st,&ac);
+            std::string text=tk.decode(gen);
+            nlohmann::json out={{"id",cid},{"object","chat.completion"},{"model","gemma-4-26b-dflash"},
+                {"choices",{{{"index",0},{"message",{{"role","assistant"},{"content",text}}},{"finish_reason","stop"}}}},
+                {"usage",{{"prompt_tokens",(int)ids.size()},{"completion_tokens",(int)gen.size()},{"total_tokens",(int)(ids.size()+gen.size())}}}};
+            res.set_content(out.dump(),"application/json");
+        }
+    });
+    svr.listen("0.0.0.0",port);
+}
+
 int main(int argc,char**argv){
     if(getenv("DUMP")) DUMP=true; system("mkdir -p /tmp/cudahs");
     std::string ckpt = argc>1?argv[1]:std::string(getenv("HOME"))+"/models/gemma-4-26B-A4B-it-NVFP4/model.safetensors";
     std::string tokfile = argc>2?argv[2]:"/tmp/tokens.txt";
     if(getenv("CTX")) CAP=atoi(getenv("CTX"));
     W4A4_TAPS=getenv("W4A4_TAPS")!=nullptr;
+    if(getenv("SERVE")){ int port=getenv("PORT")?atoi(getenv("PORT")):8080; run_server(ckpt,port); return 0; }
     Model m(ckpt); SC=new Scratch(); DS=new DScratch(); init_clut(); Session* S=new Session();
     {   // quantize the bf16 embed -> NVFP4 (E2M1 + e4m3 group-16 scales) for a 4x-lighter lm_head GEMV
         const uint16_t* embp=m.dptr<const uint16_t*>("model.language_model.embed_tokens.weight");

@@ -11,7 +11,7 @@ if [ kernels/cutlass_moe.cu -nt build/cutlass_moe.o ] || [ ! -f build/cutlass_mo
   nvcc -std=c++17 -O2 --expt-relaxed-constexpr -c $CUTLASS -I include \
     -gencode arch=compute_110a,code=sm_110a kernels/cutlass_moe.cu -o build/cutlass_moe.o
 fi
-nvcc -O2 -arch=sm_110a --default-stream per-thread -I include \
+nvcc -O2 -arch=sm_110a --default-stream per-thread -Xcompiler -pthread -I include \
   src/forward.cu src/draft.cu src/megakernel.cu kernels/fp4_gemm.cu kernels/tc_verify_gemm.cu kernels/nvfp4_quant.cu kernels/elementwise.cu kernels/attention.cu \
   build/cutlass_moe.o \
   -lcublasLt -o build/forward "$@"
