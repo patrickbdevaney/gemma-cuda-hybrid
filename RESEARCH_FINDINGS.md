@@ -60,3 +60,19 @@ THE BLACK SWAN (big effort, biggest prize): activation sparsity TEAL/CATS -> thr
 KERNEL #1 bottleneck (pending MoE agent): the MoE verify (40%). 
 SPEC-DECODE (testable): bigger block BLK 16->24, adaptive draft length.
 DO-NOT: FP8/FP4 draft (tested-LOST), trees, drafter-swap, KV-quant<32k, PowerInfer, tcgen05, DSMEM.
+
+## AGENT 4 RETURNED (relaunched, grounded): engines + MoE-at-bs=1 — CODE-PROVEN, reorders the MoE plan
+DIAGNOSIS (high-conf): MoE 55%compute/30%mem = ISSUE/LATENCY-bound on a dependency chain (NOT compute, NOT bandwidth). Warps eligible-but-stalled on dequant→FMA→shuffle chain. NOT grid-starved. So: cut the chain latency (ILP + tail), not bytes.
+### ★ #1 HIGHEST-EV (implement first): MULTIPLE OUTPUTS PER WARP w/ SHARED ACTIVATION operand
+- Each warp owns R=2-4 independent OUTPUT rows, R-wide reg accumulator, reuses the loaded activation across all R. llama.cpp mmvq.cu:566/579-582/632 (`float tmp[ncols_dst][rows_per_cuda_block]`).
+- DIFFERENT from our failed 2-way ILP split: that split ONE output's reduction (no reuse→register wall); THIS is R DIFFERENT outputs sharing the activation → registers buy ILP AND reuse. **down_bw ALREADY does this (RB=2); gateup is 1-output/warp = the gap.**
+- +20-40% on GEMM (×0.4 step). BIT-EXACT (per-dot summation order unchanged). Start R=2 measure then R=4. PAIR with #2.
+### #2 cap maxrregcount 40-56 (enabler for #1; frees regs for occupancy, unblocks without spill). +5-15%, bit-exact.
+### #3 persistent expert-major kernel + whole-step ONE CUDA graph (removes 60-78 per-expert launches + tail-straggler). +15-30% BUT check current graph coverage first (if verify already graphed, launch part already banked). High cost. Hand-roll scheduler (MPK can't express MoE routing).
+### #4 fuse gate+up into one w1 GEMM + in-register SwiGLU + fold router weight (DeepGEMM/vLLM-marlin/llama.cpp). +10-20% GEMM1. Bit-exact if fp32 accum + matched SwiGLU order.
+### #5 fuse finalize/scatter into GEMM2 epilogue (atomic scatter-add). +5-15%. Bit-exact ONLY if fp32 accum before bf16 store.
+### #6 gather-in-prologue via ids-indirection (no permute pass; Thor unified = pointer arith). Low cost, enables #3. Bit-exact.
+### #7 interleave FP4 unpack/scale ALU with prev K-chunk FMAs (Marlin ALU pipelining, NOT cp.async). +5-15%. Subsumed if #1 fills issue slots.
+### #8 shorten/overlap warp-reduce tail. +5-10%.
+### DO-NOT (confirmed): block-sparse/MegaBlocks/DeepGEMM tile-padded masked GEMM (16-128× padding at 1-2 tok/expert — matches our tcgen05 dead-end); smaller FlashInfer tile (bottoms at 8); memory-side as PRIMARY lever (30% mem = not the wall).
+### PLAN: #1+#2 together first (gateup RB=2, reg cap), measure, R=4. Then (after checking graph coverage) #3. Fusions #4-#6 = bit-exact secondary.
