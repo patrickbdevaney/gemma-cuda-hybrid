@@ -113,17 +113,20 @@ static inline int tap_slot(int L){ for(int j=0;j<6;++j) if(TAP_LAYERS[j]==L) ret
 
 // ---- KV-cache decode kernels ----
 // store projected K/V (fp32 [m,nkv,hd]) into BF16 cache at positions [base, base+m)
-__global__ void k_store_kv(uint16_t* cache, const float* src, int m, int nkv, int hd){
+__device__ __forceinline__ float hw_e4m3(uint8_t b){ __half_raw r=__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)b,__NV_E4M3); return __half2float(*reinterpret_cast<__half*>(&r)); }
+__global__ void k_store_kv(void* cache, const float* src, int m, int nkv, int hd, bool fp8){
     int i=blockIdx.x*blockDim.x+threadIdx.x; int n=m*nkv*hd; if(i>=n)return;
     int t=i/(nkv*hd), rest=i%(nkv*hd);
-    float v=src[i]; unsigned u; memcpy(&u,&v,4); cache[(size_t)(g_base+t)*nkv*hd + rest]=(uint16_t)(u>>16);
+    float v=src[i]; size_t idx=(size_t)(g_base+t)*nkv*hd + rest;
+    if(fp8) ((uint8_t*)cache)[idx]=(uint8_t)__nv_cvt_float_to_fp8(v,__NV_SATFINITE,__NV_E4M3);   // FP8 e4m3 KV (server): half the bytes
+    else { unsigned u; memcpy(&u,&v,4); ((uint16_t*)cache)[idx]=(uint16_t)(u>>16); }              // BF16 KV (bit-exact gate path)
 }
 // single-query-block attention over a BF16 KV cache. query i (abs pos base+i) attends keys [lo, base+i].
 // out[m,nh,hd], Q[m,nh,hd] fp32; Kc/Vc[CAP,nkv,hd] bf16. window=0 => full causal.
 // HEAD-PACKED: one block per (query i, kv_head kvh) processes ALL G=nh/nkv sibling query heads; KV read ONCE
 // (was 4x redundant per query-head). Batched reduction over the G heads keeps syncs low.
-__global__ void sdpa_cache_kernel(float* out, const float* Q, const uint16_t* Kc, const uint16_t* Vc,
-                                  int m, int nkv, int nh, int hd, int window, float scaling){
+__global__ void sdpa_cache_kernel(float* out, const float* Q, const void* Kc, const void* Vc,
+                                  int m, int nkv, int nh, int hd, int window, float scaling, bool fp8){
     int i=blockIdx.x, kvh=blockIdx.y; if(i>=m||kvh>=nkv) return;
     int G=nh/nkv, p=g_base+i, lo=(window>0)?max(0,p-window+1):0, d=threadIdx.x;
     extern __shared__ float red[];   // [G*hd] only; Qs/acc in registers -> shmem small even for hd=512,G=8
@@ -134,8 +137,9 @@ __global__ void sdpa_cache_kernel(float* out, const float* Q, const uint16_t* Kc
     if(d<G){ mr[d]=-1e30f; lr[d]=0.f; }
     __syncthreads();
     for(int j=lo;j<=p;++j){
-        unsigned uk=(unsigned)Kc[((size_t)j*nkv+kvh)*hd+d]<<16; float kf; memcpy(&kf,&uk,4);   // KV read ONCE for all G heads
-        unsigned uv=(unsigned)Vc[((size_t)j*nkv+kvh)*hd+d]<<16; float vf; memcpy(&vf,&uv,4);
+        size_t kidx=((size_t)j*nkv+kvh)*hd+d; float kf,vf;   // KV read ONCE for all G heads
+        if(fp8){ kf=hw_e4m3(((const uint8_t*)Kc)[kidx]); vf=hw_e4m3(((const uint8_t*)Vc)[kidx]); }
+        else { unsigned uk=(unsigned)((const uint16_t*)Kc)[kidx]<<16; memcpy(&kf,&uk,4); unsigned uv=(unsigned)((const uint16_t*)Vc)[kidx]<<16; memcpy(&vf,&uv,4); }
         #pragma unroll
         for(int g=0;g<8;++g) if(g<G) red[g*hd+d]=qs[g]*kf;
         __syncthreads();
@@ -242,8 +246,7 @@ __global__ void k_fp4_roundtrip(float* x,long n){
 static bool W4A4_TAPS=false;
 __device__ __forceinline__ float e4m3d(uint8_t b){ int s=(b>>7)&1,e=(b>>3)&0xF,man=b&7; float v=(e==0)?(man*0.125f*0.015625f):(ldexpf(1.f+man*0.125f,e-7)); return s?-v:v; }
 __constant__ float C_LUT[256];   // e4m3 byte -> value, computed once (no per-block recompute)
-// HW e4m3 block-scale decode (register-only, no memory op) — replaces the DIVERGENT constant C_LUT lookup
-__device__ __forceinline__ float hw_e4m3(uint8_t b){ __half_raw r=__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)b,__NV_E4M3); return __half2float(*reinterpret_cast<__half*>(&r)); }
+// HW e4m3 block-scale decode (register-only) — hw_e4m3 now defined above k_store_kv (shared with FP8 KV read)
 static void init_clut(){ float h[256]; for(int i=0;i<256;++i){ int s=(i>>7)&1,e=(i>>3)&0xF,man=i&7;
     float v=(e==0)?(man*0.125f*0.015625f):((1.f+man*0.125f)*ldexp(1.0,e-7)); h[i]=s?-v:v; }
     CU(cudaMemcpyToSymbol(C_LUT,h,sizeof(h))); }
@@ -520,11 +523,12 @@ struct DScratch {
 static DScratch* DS;
 
 // ---- single-session KV cache (BF16), fixed capacity ----
-static int CAP = 8192;   // context capacity (set via CTX env); 65536 for full 64K target
+static int CAP = 8192;   // context capacity (set via CTX env); server defaults to 65536 (64K)
+static bool g_fp8kv = false;   // FP8 (e4m3) KV cache: half the bytes, lossy (server opts in; gate stays bf16/bit-exact)
 struct Session {
-    uint16_t* Kc[NLAYER]; uint16_t* Vc[NLAYER]; int valid_len=0;
+    uint8_t* Kc[NLAYER]; uint8_t* Vc[NLAYER]; int valid_len=0;   // byte buffers: bf16=2B/elem or fp8=1B/elem
     Session(){ for(int L=0;L<NLAYER;++L){ int nkv=is_full(L)?NKV_F:NKV_S, hd=is_full(L)?HD_F:HD_S;
-        size_t sz=(size_t)CAP*nkv*hd*2; CU(cudaMalloc(&Kc[L],sz)); CU(cudaMalloc(&Vc[L],sz)); } }
+        size_t sz=(size_t)CAP*nkv*hd*(g_fp8kv?1:2); CU(cudaMalloc(&Kc[L],sz)); CU(cudaMalloc(&Vc[L],sz)); } }
 };
 
 // W4A4 Linear: out_row[M,N] = (in_row[M,K] @ W[N,K]^T) using stored global scales. Pads M>=128.
@@ -608,10 +612,10 @@ static void attention_cached(Model& m, Session& S, float* h, int mtok, int base,
     k_rope_tables<<<mtok,hd/2>>>(dc, ds, hd, theta, rang);   // reads g_base
     rope_rotate_half(q, dc, ds, mtok, NHEAD, hd, hd, 0);
     rope_rotate_half(k, dc, ds, mtok, nkv,   hd, hd, 0);
-    k_store_kv<<<(mtok*kd+255)/256,256>>>(S.Kc[L], k, mtok, nkv, hd);   // reads g_base
-    k_store_kv<<<(mtok*kd+255)/256,256>>>(S.Vc[L], v, mtok, nkv, hd);
+    k_store_kv<<<(mtok*kd+255)/256,256>>>(S.Kc[L], k, mtok, nkv, hd, g_fp8kv);   // reads g_base
+    k_store_kv<<<(mtok*kd+255)/256,256>>>(S.Vc[L], v, mtok, nkv, hd, g_fp8kv);
     int G=NHEAD/nkv; int shmem=G*hd*4; dim3 grid(mtok,nkv);   // head-packed: one block per (query, kv_head)
-    sdpa_cache_kernel<<<grid,hd,shmem>>>(ao, q, S.Kc[L], S.Vc[L], mtok, nkv, NHEAD, hd, is_full(L)?0:SWIN, 1.0f);   // reads g_base
+    sdpa_cache_kernel<<<grid,hd,shmem>>>(ao, q, S.Kc[L], S.Vc[L], mtok, nkv, NHEAD, hd, is_full(L)?0:SWIN, 1.0f, g_fp8kv);   // reads g_base
     if(MEGA && mtok==1 && !W4A4_TAPS){   // M2: fused o_proj + post_attn_norm + residual
         std::string o_=P+"self_attn.o_proj";
         mega_oproj(h, ao, m.dptr<const uint16_t*>(P+"post_attention_layernorm.weight"),
@@ -825,7 +829,10 @@ static std::vector<std::pair<std::string,std::string>> parse_msgs(const nlohmann
         msgs.push_back({role,content}); }
     return msgs; }
 static void run_server(const std::string& ckpt, int port){
+    CAP = getenv("CTX")?atoi(getenv("CTX")):65536;                  // server default 64K context (CTX to override)
+    g_fp8kv = getenv("FP8KV")?(atoi(getenv("FP8KV"))!=0):true;      // FP8 KV default ON for the server (FP8KV=0 to disable)
     Model m(ckpt);
+    printf("[server] CAP(context)=%d  fp8_kv=%d\n", CAP, (int)g_fp8kv);
     SC=new Scratch(); DS=new DScratch(); init_clut(); Session* S=new Session();
     { const uint16_t* embp=m.dptr<const uint16_t*>(EMBN);   // quantize tied embed -> NVFP4 lm_head (same as benchmark setup)
       CU(cudaMalloc(&g_ewp,(size_t)VOCAB*(H/2))); CU(cudaMalloc(&g_ews,(size_t)VOCAB*(H/16)));
