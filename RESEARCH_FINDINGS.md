@@ -76,3 +76,6 @@ DIAGNOSIS (high-conf): MoE 55%compute/30%mem = ISSUE/LATENCY-bound on a dependen
 ### #8 shorten/overlap warp-reduce tail. +5-10%.
 ### DO-NOT (confirmed): block-sparse/MegaBlocks/DeepGEMM tile-padded masked GEMM (16-128× padding at 1-2 tok/expert — matches our tcgen05 dead-end); smaller FlashInfer tile (bottoms at 8); memory-side as PRIMARY lever (30% mem = not the wall).
 ### PLAN: #1+#2 together first (gateup RB=2, reg cap), measure, R=4. Then (after checking graph coverage) #3. Fusions #4-#6 = bit-exact secondary.
+
+## IMPLEMENTED + RESULT: MoE gateup RB=2 (agent #1) = LOST (map-vs-territory)
+Tried multiple-outputs-per-warp (RB=2, shared activation) on gateup: U=2 → -0.8% (116 vs 117); U=4 + __launch_bounds__(256,6) → -9% (107, register-cap forced spilling). BIT-EXACT but regresses. WHY: llama.cpp mmvq RB is code-proven for a DENSE single-weight GEMV; our gateup has 4 weight streams (gate+up × 2 rows) = 2× down_bw's register load, so RB=2 blows the register budget and the activation-reuse gain doesn't outweigh it. down_bw already has RB=2 and works BECAUSE it's single-stream. → MoE kernel is resistant to ILP levers (both 2-way-split AND RB=2 lost to the register wall). Next MoE lever = STRUCTURAL: fuse gate+up (#4) or persistent expert-major (#3) — big restructures. OR pivot to the activation-sparsity black swan (highest-EV overall, reads fewer bytes).
