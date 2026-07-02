@@ -7,6 +7,27 @@
 #include "elementwise.h"
 #include "attention.h"
 #include "draft.h"
+#include <algorithm>
+#include <vector>
+// TEAL/CATS activation-sparsity probe (SPARSITY=1): per-row retained-L2-norm at each magnitude-threshold sparsity.
+static void measure_sparsity(const __half* dev, int rows, int dim, const char* name){
+    std::vector<__half> h((size_t)rows*dim);
+    cudaMemcpy(h.data(), dev, (size_t)rows*dim*sizeof(__half), cudaMemcpyDeviceToHost);
+    const double sp[5]={0.3,0.4,0.5,0.6,0.7}; double ret[5]={0,0,0,0,0}, zf=0; int used=0;
+    std::vector<float> mag(dim);
+    for(int r=0;r<rows;++r){
+        double total=0; int nz=0;
+        for(int d=0;d<dim;++d){ float v=__half2float(h[(size_t)r*dim+d]); mag[d]=fabsf(v); total+=(double)v*v; if(mag[d]<1e-4f)nz++; }
+        if(total<=0) continue;   // skip empty rows (unrouted hbuf slots)
+        used++; zf+=(double)nz/dim;
+        std::sort(mag.begin(), mag.end());
+        for(int s=0;s<5;++s){ int cut=(int)(sp[s]*dim); double disc=0; for(int d=0;d<cut;++d) disc+=(double)mag[d]*mag[d];
+            ret[s]+=sqrt(1.0-disc/total); }
+    }
+    if(!used) used=1;
+    printf("[SPARSITY %s] rows=%d dim=%d  near-zero(<1e-4)=%.1f%%  retained-L2 @ sparsity  30%%=%.4f 40%%=%.4f 50%%=%.4f 60%%=%.4f 70%%=%.4f\n",
+        name, used, dim, 100.0*zf/used, ret[0]/used, ret[1]/used, ret[2]/used, ret[3]/used, ret[4]/used);
+}
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_fp4.h>
@@ -626,6 +647,10 @@ static void moe(Model& m, float* h, int seq, int L){
         CU(cudaMemsetAsync(DS->ecount,0,128*4,0));
         k_moe_invert<<<(seq*8+255)/256,256>>>(DS->ecount, DS->elist, top8_ids, seq*8, 16);
         k_moe_gateup_grouped<<<(unsigned)((128*MOE_INT+7)/8),256>>>(hbuf, x2_16, DS->ecount, DS->elist, 16, ep->gp,ep->gs,ep->gg, ep->up,ep->us,ep->ug, H, MOE_INT);
+        { static bool spm=getenv("SPARSITY")!=nullptr; static int spc=0;
+          if(spm && spc<3){ spc++; cudaDeviceSynchronize();
+            measure_sparsity(x2_16, seq, H, "x2 (gate/up input)");
+            measure_sparsity(hbuf, seq*8, MOE_INT, "hbuf (down input=silu*up)"); } }
     } else
     k_moe_gateup<<<(unsigned)((seq*TOPK*MOE_INT+7)/8),256>>>(hbuf, x2_16, top8_ids, ep->gp,ep->gs,ep->gg, ep->up,ep->us,ep->ug, seq, H, MOE_INT);
     if(seq>1 && seq<=16){   // BANDWIDTH-OPTIMAL down: weight-resident (reuse each expert weight across its tokens) + per-assignment partials (no atomics) + cheap finalize
