@@ -825,19 +825,19 @@ static std::string sse_reason(const std::string& cid,const std::string& d){   //
 // routes generated tokens to content vs reasoning via gemma-4 channel state (<|channel>thought..<channel|>answer),
 // decoding each stream separately for correct UTF-8. Also strips the channel-name + control tokens.
 struct ChanRouter {
-    Tokenizer* tk; int state=0;   // 0=content, 1=reading channel-name, 2=inside thought channel
-    std::vector<int> cid_, rid_, tid_; std::string cprev, rprev; bool tstate=false;
+    Tokenizer* tk; int state=0;   // 0=bare content, 1=reading channel-name, 2=thought(reasoning), 3=named channel (content)
+    std::vector<int> cid_, rid_, tid_, nid_; std::string cprev, rprev; bool tstate=false;
     std::vector<std::string> tools_raw;   // captured "call:name{args}" tool-call strings
     bool feed(int t, std::string& cd, std::string& rd){   // false => stop token
         cd.clear(); rd.clear();
-        if(t==tk->chan_start){ state=1; return true; }
-        if(state==1){ if(t==107) state=2; return true; }         // skip channel name up to '\n'
-        if(t==tk->chan_end){ state=0; return true; }
+        if(t==tk->chan_start){ state=1; nid_.clear(); return true; }
+        if(state==1){ if(t==107){ std::string nm=tk->decode(nid_); state=(nm.find("thought")!=std::string::npos||nm.find("analysis")!=std::string::npos)?2:3; } else nid_.push_back(t); return true; }
+        if(t==tk->chan_end){ state=0; return true; }             // channel closed -> back to bare content
         if(t==tk->tcall_start){ tstate=true; tid_.clear(); return true; }   // <|tool_call>
         if(tstate){ if(t==tk->tcall_end){ tools_raw.push_back(tk->decode(tid_)); tstate=false; } else tid_.push_back(t); return true; }
         if(tk->is_stop(t)) return false;
-        if(state==2){ rid_.push_back(t); std::string f=tk->decode(rid_); rd=f.substr(rprev.size()); rprev=f; }
-        else        { cid_.push_back(t); std::string f=tk->decode(cid_); cd=f.substr(cprev.size()); cprev=f; }
+        if(state==2){ rid_.push_back(t); std::string f=tk->decode(rid_); rd=f.substr(rprev.size()); rprev=f; }   // thought -> reasoning_content
+        else        { cid_.push_back(t); std::string f=tk->decode(cid_); cd=f.substr(cprev.size()); cprev=f; }   // final/bare -> content
         return true;
     }
     std::string content(){ return tk->decode(cid_); }
@@ -919,7 +919,7 @@ static void run_server(const std::string& ckpt, int port){
                 int reused=0; int t0=engine_prefill_cached(m,*S,ids,taps_ctx,&reused);
                 fprintf(stderr,"[prefix-cache] reused %d/%zu prompt tokens\n",reused,ids.size());
                 std::string r0=sse_role(cid); sink.write(r0.data(),r0.size());
-                ChanRouter rt{&tk, think?2:0}; bool alive=true;
+                ChanRouter rt{&tk}; bool alive=true;
                 engine_generate_dflash(m,*S,dm,taps_ctx,k,t0,max_tokens,0.f,invT,do_sample,seed0,[&](int t)->bool{
                     std::string cd,rd; if(!rt.feed(t,cd,rd)) return false;
                     if(!rd.empty()){ std::string c=sse_reason(cid,rd); if(!sink.write(c.data(),c.size())){alive=false;return false;} }
@@ -930,7 +930,7 @@ static void run_server(const std::string& ckpt, int port){
             std::lock_guard<std::mutex> lk(g_serve_mtx);
             int reused=0; int t0=engine_prefill_cached(m,*S,ids,taps_ctx,&reused);
             fprintf(stderr,"[prefix-cache] reused %d/%zu prompt tokens\n",reused,ids.size());
-            ChanRouter rt{&tk, think?2:0}; int st=0,ac=0, ntok=0;
+            ChanRouter rt{&tk}; int st=0,ac=0, ntok=0;
             engine_generate_dflash(m,*S,dm,taps_ctx,k,t0,max_tokens,0.f,invT,do_sample,seed0,[&](int t){ std::string cd,rd; ntok++; return rt.feed(t,cd,rd); },&st,&ac);
             nlohmann::json msg={{"role","assistant"},{"content",rt.content()}};
             std::string reason=rt.reasoning(); if(!reason.empty()) msg["reasoning_content"]=reason;

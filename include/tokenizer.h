@@ -18,6 +18,7 @@ struct Tokenizer {
     int eos_id=1, bos_id=2, turn_start=105, turn_end=106;   // gemma-4: <|turn>=105, <turn|>=106
     int chan_start=100, chan_end=101;                        // <|channel>=100, <channel|>=101
     int tool_start=46, tool_end=47, tcall_start=48, tcall_end=49;   // <|tool>/<tool|> (decl), <|tool_call>/<tool_call|>
+    int think_id=98, tresp_start=50, tresp_end=51;                  // <|think|> (triggers CoT), <|tool_response>/<tool_response|>
     std::vector<int> stop_ids;                               // generation stops: <eos>, <turn|>, <|tool_response>=50
 
     static uint64_t pk(int a,int b){ return ((uint64_t)(uint32_t)a<<32)|(uint32_t)(uint32_t)b; }
@@ -49,6 +50,8 @@ struct Tokenizer {
         auto t0=vocab.find("<|tool>"), t1=vocab.find("<tool|>"), t2=vocab.find("<|tool_call>"), t3=vocab.find("<tool_call|>");
         if(t0!=vocab.end())tool_start=t0->second; if(t1!=vocab.end())tool_end=t1->second;
         if(t2!=vocab.end())tcall_start=t2->second; if(t3!=vocab.end())tcall_end=t3->second;
+        auto tk98=vocab.find("<|think|>"), tr0=vocab.find("<|tool_response>"), tr1=vocab.find("<tool_response|>");
+        if(tk98!=vocab.end())think_id=tk98->second; if(tr0!=vocab.end())tresp_start=tr0->second; if(tr1!=vocab.end())tresp_end=tr1->second;
         stop_ids={eos_id, turn_end}; auto tr=vocab.find("<|tool_response>"); if(tr!=vocab.end()) stop_ids.push_back(tr->second);
     }
     // gemma-4 chat prompt. msgs=[(role,content)]. enable_thinking: false pre-fills an empty thought channel
@@ -57,18 +60,17 @@ struct Tokenizer {
                                  const std::vector<std::string>& tool_decls={}){
         std::vector<int> ids={bos_id};
         bool has_sys = !msgs.empty() && msgs[0].first=="system";
-        if(has_sys || !tool_decls.empty()){   // first system turn carries system content + tool declarations
+        if(has_sys || !tool_decls.empty() || enable_thinking){   // first system turn: <|think|> marker + system content + tool decls
             ids.push_back(turn_start); encode_text("system\n",ids);
+            if(enable_thinking){ ids.push_back(think_id); encode_text("\n",ids); }   // <|think|> triggers real CoT (gemma-4 fixed template)
             if(has_sys) encode_text(msgs[0].second,ids);
             for(auto& d : tool_decls){ ids.push_back(tool_start); encode_text(d,ids); ids.push_back(tool_end); }
             ids.push_back(turn_end); encode_text("\n",ids);
         }
         for(size_t i=(has_sys?1:0); i<msgs.size(); ++i){ auto& m=msgs[i]; std::string role=(m.first=="assistant")?"model":m.first;
             ids.push_back(turn_start); encode_text(role+"\n",ids); encode_text(m.second,ids); ids.push_back(turn_end); encode_text("\n",ids); }
-        ids.push_back(turn_start); encode_text("model\n",ids);   // generation prompt
-        ids.push_back(chan_start); encode_text("thought\n",ids);        // open thought channel
-        if(!enable_thinking) ids.push_back(chan_end);                    // OFF: close immediately (empty thought -> straight to answer)
-        return ids;                                                      // ON: leave open -> model reasons inside until it emits <channel|>
+        ids.push_back(turn_start); encode_text("model\n",ids);   // generation prompt — no channel stub (patched gemma-4 behavior)
+        return ids;
     }
     bool is_stop(int id){ for(int s:stop_ids) if(id==s) return true; return false; }
     // BPE a normalized (spaces already ▁) plain segment
