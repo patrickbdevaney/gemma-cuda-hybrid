@@ -6,7 +6,7 @@ static bool eq(const std::vector<int>&a,const std::vector<int>&b){ if(a.size()!=
 static void pr(const char* s,const std::vector<int>&v){ printf("%-40s -> [",s); for(size_t i=0;i<v.size();++i)printf("%s%d",i?", ":"",v[i]); printf("]\n"); }
 int main(int argc,char**argv){
     Tokenizer tk; tk.load(argc>1?argv[1]:std::string(getenv("HOME")+std::string("/models/gemma-4-26B-A4B-it-NVFP4/tokenizer.json")));
-    printf("loaded: vocab=%zu merges=%zu specials=%zu eos=%d bos=%d eot=%d\n",tk.vocab.size(),tk.merges.size(),tk.specials.size(),tk.eos_id,tk.bos_id,tk.eot_id);
+    printf("loaded: vocab=%zu merges=%zu specials=%zu eos=%d bos=%d turn_end=%d\n",tk.vocab.size(),tk.merges.size(),tk.specials.size(),tk.eos_id,tk.bos_id,tk.turn_end);
     struct T{ const char* s; std::vector<int> ref; };
     std::vector<T> tests={
         {"Hello, world!", {9259,236764,1902,236888}},
