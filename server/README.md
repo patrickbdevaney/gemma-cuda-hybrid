@@ -31,5 +31,7 @@ KV size + dtype are launch-config (the "dynamic reset" interface — set per run
 - **Reasoning delineation**: ChanRouter parses gemma-4 <|channel>thought..<channel|> -> reasoning_content vs content
   (streaming reasoning_content deltas + non-stream field), enable_thinking / reasoning_effort / chat_template_kwargs.
   Full SGLang/vLLM reasoning-parser parity. (gemma-4-A4B-it emits empty thoughts; infra ready for CoT models.)
-- **TODO (tool calling)**: parse <|tool_call>call:name{args}<tool_call|> -> OpenAI tool_calls, and format request
-  `tools` into the gemma tool prompt. Tokens known (48/49); the gemma arg-format + jinja tool-macro replication is the work.
+- **Tool calling** (WORKS end-to-end): request `tools` -> gemma `<|tool>declaration:name{...}<tool|>` in system turn;
+  model emits `<|tool_call>call:name{args}<tool_call|>` -> ChanRouter parses -> OpenAI `tool_calls` (name + JSON `arguments`
+  via gemma-args->JSON converter) + `finish_reason:"tool_calls"`. Verified: get_weather("Tokyo","celsius") -> valid JSON args.
+  (Non-streaming; streaming tool_call deltas + exact <|"|>-escaped nested args = future polish.)

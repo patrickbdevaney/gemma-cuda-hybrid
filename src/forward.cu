@@ -826,12 +826,15 @@ static std::string sse_reason(const std::string& cid,const std::string& d){   //
 // decoding each stream separately for correct UTF-8. Also strips the channel-name + control tokens.
 struct ChanRouter {
     Tokenizer* tk; int state=0;   // 0=content, 1=reading channel-name, 2=inside thought channel
-    std::vector<int> cid_, rid_; std::string cprev, rprev;
+    std::vector<int> cid_, rid_, tid_; std::string cprev, rprev; bool tstate=false;
+    std::vector<std::string> tools_raw;   // captured "call:name{args}" tool-call strings
     bool feed(int t, std::string& cd, std::string& rd){   // false => stop token
         cd.clear(); rd.clear();
         if(t==tk->chan_start){ state=1; return true; }
         if(state==1){ if(t==107) state=2; return true; }         // skip channel name up to '\n'
         if(t==tk->chan_end){ state=0; return true; }
+        if(t==tk->tcall_start){ tstate=true; tid_.clear(); return true; }   // <|tool_call>
+        if(tstate){ if(t==tk->tcall_end){ tools_raw.push_back(tk->decode(tid_)); tstate=false; } else tid_.push_back(t); return true; }
         if(tk->is_stop(t)) return false;
         if(state==2){ rid_.push_back(t); std::string f=tk->decode(rid_); rd=f.substr(rprev.size()); rprev=f; }
         else        { cid_.push_back(t); std::string f=tk->decode(cid_); cd=f.substr(cprev.size()); cprev=f; }
@@ -840,6 +843,28 @@ struct ChanRouter {
     std::string content(){ return tk->decode(cid_); }
     std::string reasoning(){ return tk->decode(rid_); }
     int n_content(){ return (int)cid_.size(); }
+    // gemma flat args {k:v,k2:3} -> JSON {"k":"v","k2":3} (best-effort; nested values kept as string)
+    static std::string args_json(const std::string& g){
+        if(g.size()<2||g[0]!='{') return "{}";
+        std::string b=g.substr(1,g.size()-2); std::vector<std::string> parts; std::string cur; int dep=0;
+        for(char c:b){ if(c=='{'||c=='[')dep++; else if(c=='}'||c==']')dep--; if(c==','&&dep==0){parts.push_back(cur);cur.clear();} else cur+=c; }
+        if(!cur.empty())parts.push_back(cur);
+        auto trim=[](std::string s){ size_t a=s.find_first_not_of(" \t"); if(a==std::string::npos)return std::string(); size_t z=s.find_last_not_of(" \t"); std::string r=s.substr(a,z-a+1);
+            if(r.size()>=2&&r.front()=='"'&&r.back()=='"')r=r.substr(1,r.size()-2); return r; };
+        nlohmann::json o=nlohmann::json::object();
+        for(auto& p:parts){ size_t co=p.find(':'); if(co==std::string::npos)continue; std::string k=trim(p.substr(0,co)),v=trim(p.substr(co+1));
+            if(v=="true")o[k]=true; else if(v=="false")o[k]=false;
+            else { char* e; double d=strtod(v.c_str(),&e); if(!v.empty()&&*e==0)o[k]=d; else o[k]=v; } }
+        return o.dump();
+    }
+    nlohmann::json tool_calls(){   // gemma "call:NAME{args}" -> OpenAI tool_calls (arguments = JSON string)
+        nlohmann::json arr=nlohmann::json::array(); int i=0;
+        for(auto& raw : tools_raw){ size_t b=raw.find('{'); std::string pre=(b==std::string::npos)?raw:raw.substr(0,b);
+            if(pre.rfind("call:",0)==0) pre=pre.substr(5);
+            std::string name=pre, args=(b==std::string::npos)?"{}":args_json(raw.substr(b));
+            arr.push_back({{"id","call_"+std::to_string(i++)},{"type","function"},{"function",{{"name",name},{"arguments",args}}}}); }
+        return arr;
+    }
 };
 static std::string sse_stop(const std::string& cid){
     nlohmann::json j={{"id",cid},{"object","chat.completion.chunk"},{"model","gemma-4-26b-dflash"},
@@ -878,7 +903,11 @@ static void run_server(const std::string& ckpt, int port){
         auto msgs=parse_msgs(j);
         bool think = j.value("enable_thinking",false) || (j.contains("chat_template_kwargs")&&j["chat_template_kwargs"].value("enable_thinking",false))
                      || (j.contains("reasoning_effort")&&j["reasoning_effort"].is_string()&&j["reasoning_effort"].get<std::string>()!="none");
-        auto ids=tk.chat_prompt(msgs,think);
+        std::vector<std::string> tool_decls;   // gemma <|tool>declaration:..<tool|> (reasonable-effort format)
+        if(j.contains("tools")&&j["tools"].is_array()) for(auto& t:j["tools"]){ if(!t.contains("function"))continue; auto& f=t["function"];
+            std::string d="declaration:"+f.value("name",std::string())+"{description:\""+f.value("description",std::string())+"\"";
+            if(f.contains("parameters")) d+=",parameters:"+f["parameters"].dump(); d+="}"; tool_decls.push_back(d); }
+        auto ids=tk.chat_prompt(msgs,think,tool_decls);
         int max_tokens=j.value("max_tokens",256); bool stream=j.value("stream",false);
         float temperature=j.value("temperature",0.0f);   // top_p accepted; v1 applies temperature only (Gumbel-max)
         bool do_sample=temperature>0.f; float invT=1.f/(temperature>0.f?temperature:1.f);
@@ -905,8 +934,10 @@ static void run_server(const std::string& ckpt, int port){
             engine_generate_dflash(m,*S,dm,taps_ctx,k,t0,max_tokens,0.f,invT,do_sample,seed0,[&](int t){ std::string cd,rd; ntok++; return rt.feed(t,cd,rd); },&st,&ac);
             nlohmann::json msg={{"role","assistant"},{"content",rt.content()}};
             std::string reason=rt.reasoning(); if(!reason.empty()) msg["reasoning_content"]=reason;
+            const char* finish="stop";
+            if(!rt.tools_raw.empty()){ msg["tool_calls"]=rt.tool_calls(); finish="tool_calls"; }
             nlohmann::json out={{"id",cid},{"object","chat.completion"},{"model","gemma-4-26b-dflash"},
-                {"choices",{{{"index",0},{"message",msg},{"finish_reason","stop"}}}},
+                {"choices",{{{"index",0},{"message",msg},{"finish_reason",finish}}}},
                 {"usage",{{"prompt_tokens",(int)ids.size()},{"completion_tokens",ntok},{"total_tokens",(int)ids.size()+ntok}}}};
             res.set_content(out.dump(),"application/json");
         }

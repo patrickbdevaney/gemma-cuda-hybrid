@@ -17,6 +17,7 @@ struct Tokenizer {
     std::vector<std::pair<std::string,int>> specials;       // (content,id), matched literally before BPE
     int eos_id=1, bos_id=2, turn_start=105, turn_end=106;   // gemma-4: <|turn>=105, <turn|>=106
     int chan_start=100, chan_end=101;                        // <|channel>=100, <channel|>=101
+    int tool_start=46, tool_end=47, tcall_start=48, tcall_end=49;   // <|tool>/<tool|> (decl), <|tool_call>/<tool_call|>
     std::vector<int> stop_ids;                               // generation stops: <eos>, <turn|>, <|tool_response>=50
 
     static uint64_t pk(int a,int b){ return ((uint64_t)(uint32_t)a<<32)|(uint32_t)(uint32_t)b; }
@@ -45,13 +46,24 @@ struct Tokenizer {
         auto cs=vocab.find("<|channel>"), ce=vocab.find("<channel|>");
         if(cs!=vocab.end()) chan_start=cs->second;
         if(ce!=vocab.end()) chan_end=ce->second;
+        auto t0=vocab.find("<|tool>"), t1=vocab.find("<tool|>"), t2=vocab.find("<|tool_call>"), t3=vocab.find("<tool_call|>");
+        if(t0!=vocab.end())tool_start=t0->second; if(t1!=vocab.end())tool_end=t1->second;
+        if(t2!=vocab.end())tcall_start=t2->second; if(t3!=vocab.end())tcall_end=t3->second;
         stop_ids={eos_id, turn_end}; auto tr=vocab.find("<|tool_response>"); if(tr!=vocab.end()) stop_ids.push_back(tr->second);
     }
     // gemma-4 chat prompt. msgs=[(role,content)]. enable_thinking: false pre-fills an empty thought channel
     // (straight to answer, fast); true lets the model reason in <|channel>thought..<channel|> (parsed to reasoning_content).
-    std::vector<int> chat_prompt(const std::vector<std::pair<std::string,std::string>>& msgs, bool enable_thinking=false){
+    std::vector<int> chat_prompt(const std::vector<std::pair<std::string,std::string>>& msgs, bool enable_thinking=false,
+                                 const std::vector<std::string>& tool_decls={}){
         std::vector<int> ids={bos_id};
-        for(auto& m : msgs){ std::string role = (m.first=="assistant")?"model":m.first;
+        bool has_sys = !msgs.empty() && msgs[0].first=="system";
+        if(has_sys || !tool_decls.empty()){   // first system turn carries system content + tool declarations
+            ids.push_back(turn_start); encode_text("system\n",ids);
+            if(has_sys) encode_text(msgs[0].second,ids);
+            for(auto& d : tool_decls){ ids.push_back(tool_start); encode_text(d,ids); ids.push_back(tool_end); }
+            ids.push_back(turn_end); encode_text("\n",ids);
+        }
+        for(size_t i=(has_sys?1:0); i<msgs.size(); ++i){ auto& m=msgs[i]; std::string role=(m.first=="assistant")?"model":m.first;
             ids.push_back(turn_start); encode_text(role+"\n",ids); encode_text(m.second,ids); ids.push_back(turn_end); encode_text("\n",ids); }
         ids.push_back(turn_start); encode_text("model\n",ids);   // generation prompt
         ids.push_back(chan_start); encode_text("thought\n",ids);        // open thought channel
