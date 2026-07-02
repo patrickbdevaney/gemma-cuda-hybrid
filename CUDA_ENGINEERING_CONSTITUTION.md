@@ -59,11 +59,21 @@ Purpose-built pure-CUDA NVFP4 + DFlash spec-decode server for `google/gemma-4-26
 - Commit each champion atomically with before/after in the message. Revert regressions/neutrals immediately.
 - Weight-repack caches keyed by src ptr; lazy on warm-up so CUDA-graph capture never sees a cudaMalloc.
 
-## 8. ROADMAP TO 157 (ordered by expected impact) — REVISED after cp.async dead-end
-0. **cp.async tc pipeline: DONE, DEAD-END** (see §4 LOST). tc GEMM at structural limit ~108. Don't retry.
-1. **[NEXT] Draft bf16 TC GEMM** — draft is ~35% of step; draft linears `k_linear_bf16` (12%) are CUDA-core + LATENCY-BOUND (SoL 41% mem/21% compute, like the w4a16 lm_head was before tc). Build a `tc_bf16_gemm` (mma.sync.m16n8k16.f32.**bf16.bf16**.f32, NO dequant, repack weight) — same win pattern that gave the lm_head +9.7%. SAFE: draft numerics only affect PROPOSALS/tau, not output (verify corrects → bit-exact output guaranteed); but MUST check tau doesn't drop. Est +3-5%.
-2. **MoE small-batch** — gateup/down are ~27%; repack per-expert weights into aligned buffers (per-expert ptrs NOT 16B-aligned → the tc-style repack fixes alignment AND enables 16B int4). SoL-profile first (is it latency or the invert/router glue?).
-3. **Draft attention / draft FC** — the rest of the 35% draft cost.
+## 8. ROADMAP — RESEARCH-SYNTHESIZED SURFACE (see RESEARCH_FINDINGS.md for full detail + citations; champion 118, 4-agent deep research done 2026-07-01)
+**Corrected roofline (NVFP4):** ~2.25 GB wt + 0.3 GB KV = 2.55 GB/tok → base ceiling **~78 tok/s** (measured 45 = 58% → ~1.7× base headroom); full-peak 107. We are NOT bandwidth/KV-bound. Verify (MoE 40% + sdpa 10% + dense) dominates the step; draft is small (block-diffusion = ONE forward, not 15).
+**GROUND TRUTH (nsys @118):** MoE verify 40% (biggest), tc_w4a16 lm_heads+dense 25%, sdpa 10%, tc_bf16 draft-linears 4.5%, k_attn 1.8%.
+IMMEDIATE (cheap, bit-exact — do first, compound):
+1. **FlashNorm** — fold RMSNorm into next GEMM weights (gemma: fold **(1+g)**, zero-centered). Removes kernel + activation round-trip. +1-3%, BIT-EXACT. arXiv:2407.09577.
+2. **Fused add+RMSNorm + fused gate+up SwiGLU** — ~35% MLP traffic cut, +3-6% (match reduce dtype to keep tau). arXiv:2602.11808.
+KERNEL #1 (biggest bottleneck):
+3. **MoE verify kernel** (40%, latency-bound 55%compute/30%mem, ~1-2 tok/expert). ILP-split LOST (register wall). Untried: fuse router+gather+GEMM+scatter; 2-outputs/warp; cut invert/router glue. (engines+MoE agent pending — MOST IMPORTANT result.)
+ALGO (testable, bit-exact):
+4. **Bigger block BLK 16→24** — acceptance-saturated (95%) so more-tokens/cycle is the ONLY tau lever + improves MoE amortization. GATE: measure tau holds (drafter trained for BLK=16).
+5. **Adaptive draft length** (AdaEDL entropy-stop) — fewer draft on hard tokens. +5-15%, lossless.
+THE BLACK SWAN (big effort, biggest prize ~1.5-1.8×):
+6. **Activation sparsity (TEAL/CATS)** — training-free magnitude threshold, skip weight COLUMNS at M=1 (fewer LPDDR bytes), stacks on NVFP4. Risk: gemma SiLU less sparse than ReLU; re-measure tau. Only lever that breaks the roofline. arXiv:2408.14690.
+PERSISTENT MEGAKERNEL (revised verdict): our loss was `grid.sync()` (~35% of token time); winners use sentinel-poll counters (Hazy/Kog/MPK). CAN win + bit-exact BUT bounded ~10-25% at huge effort (we're already ~73% of floor + have graphs). Not highest-EV.
+DEAD/DON'T (evidence in RESEARCH_FINDINGS): FP8/FP4 draft (tested-LOST tau); trees; drafter-swap (τ downgrade); KV-quant <32k; PowerInfer/hot-expert (unified mem = no tier); tcgen05/TMEM (MMA_M=128); DSMEM clusters (Thor 2-SM cap); split-K/stream-K/TMA (not BW levers); cp.async on tc (block-parallelism hides latency).
 4. **Whole-step CUDA graph** coverage (~20% launch overhead in general; we're pure-CUDA so partial).
 5. **FP8 KV cache** (long-context; head-pack already cut KV 4x).
 6. Re-profile after each — the bottleneck moves (it was lm_head all along, not what earlier filtered profiles showed).
