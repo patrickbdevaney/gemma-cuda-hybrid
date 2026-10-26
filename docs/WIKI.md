@@ -11,7 +11,7 @@ to a file; where something is undocumented it is called out as undocumented rath
 
 Repo history: 81 commits, all dated **2026-07-01 → 2026-07-03**. The repo is a fork of the sibling
 `~/gemma-cuda-server` ("v1.0 banked", DFlash 82 tok/s) at commit `db8de1b`. Anything in
-`OPTIMIZATION_LOG.md` cycles 0–25 and `CHAMPION.md` describes the *parent* repo's history, not
+`../dev/archive/OPTIMIZATION_LOG.md` cycles 0–25 and `../dev/archive/CHAMPION.md` describes the *parent* repo's history, not
 work done here.
 
 ---
@@ -50,9 +50,9 @@ The champion benchmark is fixed and narrow. From `CUDA_ENGINEERING_CONSTITUTION.
 | Engine | tok/s | acceptance τ | ms/step | source |
 |---|---|---|---|---|
 | **This engine, DFlash** | **~118** | **13.33 / 14 ≈ 95%** | ~123 | `CUDA_ENGINEERING_CONSTITUTION.md` header, git `f59daf3` |
-| This engine, base (no spec) | **~44.5–45** | — | — | constitution §0, `LOOP_LOG.md` |
+| This engine, base (no spec) | **~44.5–45** | — | — | constitution §0, `../dev/archive/LOOP_LOG.md` |
 | vLLM 0.22.1rc1 + DFlash, same prompt/weights/box | **107.5** | 9.21 | 85 | `BENCHMARK_COMPARISON.md` |
-| vLLM base (no spec) | 52 | — | — | `RESEARCH_SYNTHESIS.md`, `reference/PERF_RESEARCH.md` |
+| vLLM base (no spec) | 52 | — | — | `../dev/archive/RESEARCH_SYNTHESIS.md`, `reference/PERF_RESEARCH.md` |
 
 So the "+10% vs vLLM" headline is **118 / 107.5 = +9.8% on this one short greedy prompt**.
 Derived ceiling quoted throughout: τ 13.33 at vLLM's 85 ms step ⇒ **~157 tok/s**.
@@ -204,7 +204,7 @@ in dataflow order in `MODELING_NOTES.md` §2: input_layernorm, q_norm, k_norm, v
 post_attention_layernorm, pre_feedforward_layernorm, router.norm(no scale),
 pre_feedforward_layernorm_2, post_feedforward_layernorm_1, post_feedforward_layernorm_2,
 post_feedforward_layernorm, post_per_layer_input_norm (PLE branch — inactive here). Plus the final
-`model.norm`. At M=1 each of these is a 1-CTA launch; `LOOP_LOG.md` iter2 measures the base-decode
+`model.norm`. At M=1 each of these is a 1-CTA launch; `../dev/archive/LOOP_LOG.md` iter2 measures the base-decode
 norms at ~9% and ~2.3 ms/token, which is what motivated the megakernel attempt.
 
 ### 3.4 MoE — a dense MLP *in parallel with* 128 routed experts
@@ -304,7 +304,7 @@ per message: <|turn>{role, assistant→model}\n{content}<turn|>\n
 <|turn>model\n                      # generation prompt
 ```
 
-Note the evolution: `SERVER_PLAN.md` §TOKENIZER SPEC describes the *old* Gemma
+Note the evolution: `../dev/archive/SERVER_PLAN.md` §TOKENIZER SPEC describes the *old* Gemma
 `<start_of_turn>`/`<end_of_turn>` template; the shipped code uses gemma-4's `<|turn>`/`<turn|>`
 markers. Git `cc2753d` records the fix from a buggy "channel pre-fill" to a real `<|think|>`
 system marker (per the fixed gemma-4 template, HF discussion #42).
@@ -370,7 +370,7 @@ mask_token_id    = 4
 `src/forward.cu:112`: `static const int TAP_LAYERS[6]={1,6,11,17,22,27};`, captured by `k_tap`
 (`forward.cu:108`) into `taps[mtok, 6, H]` — the **residual stream after** each of those decoder
 layers (EAGLE3 "aux hidden state" convention), for every position the target forwards over
-(prefill: all prompt positions; verify: all block positions). `OPTIMIZATION_LOG.md` pre-loop history
+(prefill: all prompt positions; verify: all block positions). `../dev/archive/OPTIMIZATION_LOG.md` pre-loop history
 records that the off-by-one tap set `[0,5,10,16,21,26]` was tried and is **worse** — the tap indices
 are load-bearing.
 
@@ -391,7 +391,7 @@ for l in 0..4:
 stream — `DFLASH_SPEC.md` calls this "Key DFlash trick". Note the asymmetry the spec flags: context
 K/V use `hidden_norm`, query tokens use the per-layer `input_layernorm`. The draft KV cache is fp32,
 `slots = cap + BLK`. Making this incremental (was O(C) per propose) was +12.4% back in the parent
-repo (`OPTIMIZATION_LOG.md` cycle 7).
+repo (`../dev/archive/OPTIMIZATION_LOG.md` cycle 7).
 
 **(B) Query forward** over `BLK=16` positions: `qids = [next_token, MASK×15]`,
 `qpos = qslot = [P0 .. P0+15]` with `P0 = ctx_pos[C-1]+1`. Then 5 qwen3 decoder layers:
@@ -434,7 +434,7 @@ k_attn<<<...>>>(ao,q,d->Kc[l],d->Vc[l],kslot_dev,nkeys,NH,NKV,HD,SCALE, nkeys-BL
 ```
 
 `DFLASH_SPEC.md` §Q2 says "**Attention is NON-CAUSAL** within the query block by default"
-(`dflash_causal = dflash_config.get("causal", False)` [72]). `OPTIMIZATION_LOG.md` pre-loop history
+(`dflash_causal = dflash_config.get("causal", False)` [72]). `../dev/archive/OPTIMIZATION_LOG.md` pre-loop history
 records the opposite as a **bug fix**: "DFlash causal-within-block mask fix (sliding layers): code
 accept 3.3→4.1". `tools/dflash_ref.py` implements the same `causal = (l<4)` rule, so the oracle
 agrees with the code, not with the spec text. **The spec text was not updated.** The file header
@@ -451,12 +451,12 @@ The draft always runs the full `BLK=16` query block and always computes `NDRAFT=
 but the engine's default is **`DK=14`** (`forward.cu:1060`, clamped to [1,15]) — so the 15th draft
 logit is computed and **discarded**, and the verify forward is **M = DK+1 = 15** positions
 (`[bonus, d0..d13]`). `DFLASH_SPEC.md` (and vLLM) use `num_speculative_tokens = 15`, block 16.
-`SERVER_PLAN.md` asserts "BLK=16 baked-in (static const), DK=14 already-optimal"; the tuning that
+`../dev/archive/SERVER_PLAN.md` asserts "BLK=16 baked-in (static const), DK=14 already-optimal"; the tuning that
 produced DK=14 is referenced ("tau 4.0 → tuned DK=14 → tau 13.33", constitution §10A) but the
 sweep itself is not recorded. τ 13.33 is therefore out of **14**, ≈95%.
 
 `RESEARCH_FINDINGS.md` lever #2 proposes BLK 16→24/32 as the only remaining τ lever (we are
-acceptance-saturated) — but the drafter was trained for block 16, and `SERVER_PLAN.md` concludes
+acceptance-saturated) — but the drafter was trained for block 16, and `../dev/archive/SERVER_PLAN.md` concludes
 "bigger block needs draft retraining (separate ML project). Bank 118." **It was never tested.**
 
 ### 4.7 Verification and the decode loop
@@ -477,7 +477,7 @@ Three acceptance modes exist:
 - **typical acceptance** (`TYP_EPS>0`): `k_typical_prob` accepts when the target's softmax prob of
   the draft token ≥ ε. `TYP_EPS=0` is byte-identical to greedy (exact-parity verified). Measured a
   **no-op on primes** at ε 0.02–0.15, T 0.3–2.0, because the draft there has no acceptance headroom;
-  kept as a production feature for low-acceptance workloads (`OPTIMIZATION_LOG.md` cycle 16).
+  kept as a production feature for low-acceptance workloads (`../dev/archive/OPTIMIZATION_LOG.md` cycle 16).
 
 Stop tokens in the DFlash loop are hard-coded `1` and `106` — **not** `Tokenizer::stop_ids`, which
 also contains 50 (`<|tool_response>`).
@@ -487,10 +487,10 @@ also contains 50 (`<|tool_response>`).
 The single most-repeated finding in this repo. Quantizing the draft body — to FP4 or FP8 —
 collapses acceptance **13.33 → 11.14** in both cases:
 
-- FP4 draft weights: `RESEARCH_SYNTHESIS.md`, DFlash 84.3→75.1 **and** τ 13.33→11.14.
-- FP8 e4m3 draft weights: `LOOP_LOG.md` iter5, DFlash 84.7→71.1, τ 13.33→11.14 — "IDENTICAL drop".
+- FP4 draft weights: `../dev/archive/RESEARCH_SYNTHESIS.md`, DFlash 84.3→75.1 **and** τ 13.33→11.14.
+- FP8 e4m3 draft weights: `../dev/archive/LOOP_LOG.md` iter5, DFlash 84.7→71.1, τ 13.33→11.14 — "IDENTICAL drop".
 
-`LOOP_LOG.md` iter5 draws the general conclusion: the research literature's "FP8 keeps acceptance"
+`../dev/archive/LOOP_LOG.md` iter5 draws the general conclusion: the research literature's "FP8 keeps acceptance"
 holds for typical EAGLE drafts, **not** for this block-diffusion draft that shares embed+lm_head and
 injects target K/V. The only draft tensor that benefits from FP4 is the **shared lm_head**, which
 is byte-bound at N=VOCAB *and* gains consistency with the verify head (§7.2).
@@ -571,7 +571,7 @@ position dependence routed through `__device__ int g_base` and `g_sample_seed` p
 `NOGRAPH=1` falls back to eager.
 
 Measured value: base decode graph was **+11.2%** (cycle 2). Whole-step graphing of DFlash was
-measured at only **~7%** (93% GPU-busy, `RESEARCH_SYNTHESIS.md`) and deprioritized.
+measured at only **~7%** (93% GPU-busy, `../dev/archive/RESEARCH_SYNTHESIS.md`) and deprioritized.
 
 ### 5.6 Profile at the champion (nsys, DFlash ~118)
 
@@ -636,15 +636,15 @@ no continuous batching.
 
 ## 7. The optimization ledger
 
-### 7.1 Reconciling CHAMPION.md, OPTIMIZATION_LOG.md and the constitution
+### 7.1 Reconciling ../dev/archive/CHAMPION.md, ../dev/archive/OPTIMIZATION_LOG.md and the constitution
 
 These three documents describe **three different eras** and only the constitution is current:
 
-- **`CHAMPION.md` is stale and internally inconsistent.** It reports BASE 44.5 (a cycle-21 number)
+- **`../dev/archive/CHAMPION.md` is stale and internally inconsistent.** It reports BASE 44.5 (a cycle-21 number)
   alongside "DFlash (predictable, DK=14) 37.42 tok/s, OLD: 30.58, accept 11.14/14" (cycle-5/6
   numbers), dated 2026-06-30, commit "cycle23", with a "Target: well-exceed 110". It predates this
   repo's entire history. **Do not use it.**
-- **`OPTIMIZATION_LOG.md`** is the parent repo's append-only log, cycles 0–25, ending at DFlash 82 /
+- **`../dev/archive/OPTIMIZATION_LOG.md`** is the parent repo's append-only log, cycles 0–25, ending at DFlash 82 /
   base 44.5 and a "researched, decided AGAINST tensor cores" verdict — which the hybrid repo then
   overturned.
 - **`CUDA_ENGINEERING_CONSTITUTION.md`** is the living state document: DFlash ~118, base ~45,
@@ -652,7 +652,7 @@ These three documents describe **three different eras** and only the constitutio
 
 ### 7.2 The arc, in order, with numbers
 
-**Parent repo (`gemma-cuda-server`), decode 0 → 82** — constitution §10B/C, `OPTIMIZATION_LOG.md`:
+**Parent repo (`gemma-cuda-server`), decode 0 → 82** — constitution §10B/C, `../dev/archive/OPTIMIZATION_LOG.md`:
 
 | Change | Effect |
 |---|---|
@@ -773,10 +773,10 @@ byte accounting improved:
 
 | Doc | Ceiling | Basis |
 |---|---|---|
-| `CHAMPION.md` | ~190 tok/s base | 1.4 GB FP4 weight/token at 273 GB/s |
-| `LOOP_LOG.md` header | ~152 | — |
-| `LOOP_LOG.md` iter3 | **137** (89 at 65% efficiency) | research pass |
-| `OPTIMIZATION_LOG.md` cycle 16 | ~94 | 2.9 GB/step incl. 1.5 GB bf16 lm_head |
+| `../dev/archive/CHAMPION.md` | ~190 tok/s base | 1.4 GB FP4 weight/token at 273 GB/s |
+| `../dev/archive/LOOP_LOG.md` header | ~152 | — |
+| `../dev/archive/LOOP_LOG.md` iter3 | **137** (89 at 65% efficiency) | research pass |
+| `../dev/archive/OPTIMIZATION_LOG.md` cycle 16 | ~94 | 2.9 GB/step incl. 1.5 GB bf16 lm_head |
 | `RESEARCH_FINDINGS.md` §3 (**latest, corrected**) | **~78** base at 200 GB/s achievable (107 at full 273) | NVFP4 = 0.5625 B/wt, ~4B active → 2.25 GB weights + ~0.3 GB KV = **2.55 GB/token** |
 
 At the current base of 45 tok/s that is **58% of achievable roofline** — i.e. the engine is *not*
@@ -918,7 +918,7 @@ verbatim from this repo needs re-checking. This is not mentioned in any document
 **Untried / unfinished**
 - **BLK 16 → 24/32** — flagged as the only remaining τ lever (we are acceptance-saturated), bit-exact
   and low-effort to test, but the drafter was trained for block 16 so it needs a τ measurement.
-  `SERVER_PLAN.md` declines it as needing retraining.
+  `../dev/archive/SERVER_PLAN.md` declines it as needing retraining.
 - **Adaptive draft length** (AdaEDL entropy-stop) — lossless, +5–15% projected, never built.
 - **FlashNorm** (fold RMSNorm into the next GEMM; gemma folds plain `weight`, not `1+g`) and fused
   add+RMSNorm / fused gate+up SwiGLU — the cheap bit-exact Tier-0 items, +1–3% and +3–6% projected.
@@ -935,7 +935,7 @@ verbatim from this repo needs re-checking. This is not mentioned in any document
 
 Recorded because a new engineer will hit these:
 
-1. **`CHAMPION.md` is stale and self-inconsistent** — base 44.5 (cycle 21) next to DFlash 37.42 /
+1. **`../dev/archive/CHAMPION.md` is stale and self-inconsistent** — base 44.5 (cycle 21) next to DFlash 37.42 /
    accept 11.14 (cycle 5–6), dated 2026-06-30. The live numbers are DFlash ~118 / base ~45 / τ 13.33
    in the constitution header. Both files are in the repo; only the constitution is current.
 2. **Constitution header vs its own §0.** The header says "DFlash ~118 … Arc 85.65→118 (+38%)";
@@ -943,7 +943,7 @@ Recorded because a new engineer will hit these:
    draft-linears-to-bf16-TC win (git `f59daf3`); §0 was not updated.
 3. **vLLM's number is workload-dependent and quoted three ways**: 107.5 tok/s / τ 9.21 / 85 ms on the
    80-token primes prompt (`BENCHMARK_COMPARISON.md`); 100–105 tok/s / τ 7.84 on the 300-token
-   workload (`REVERSE_ENGINEERING.md`); "110" described as **unsourced** in `OPTIMIZATION_LOG.md`
+   workload (`REVERSE_ENGINEERING.md`); "110" described as **unsourced** in `../dev/archive/OPTIMIZATION_LOG.md`
    cycle 25. The +10% headline uses the 107.5 figure, which is the apples-to-apples one.
 4. **`DK=14` vs `num_speculative_tokens=15`.** `README.md` and the code use k=14 (verify M=15);
    `DFLASH_SPEC.md` and vLLM use 15 (verify M=16). The draft still computes all 15 mask logits and
@@ -964,7 +964,7 @@ Recorded because a new engineer will hit these:
    with a patched host arch guard. Both cannot be true as stated; treat the shipping fact as
    authoritative: **the champion kernel uses the fp16 MMA `m16n8k16.f32.f16.f16.f32` with FP4
    dequantized in registers**, not any FP4 MMA.
-8. **`OPTIMIZATION_LOG.md` cycle 25 says "Thor sm_110a = tcgen05/TMEM only (NO warp mma.sync)"** —
+8. **`../dev/archive/OPTIMIZATION_LOG.md` cycle 25 says "Thor sm_110a = tcgen05/TMEM only (NO warp mma.sync)"** —
    refuted by the hybrid repo's champion, which is built on warp `mma.sync`. That cycle-25 research
    verdict ("decided AGAINST tensor cores") was overturned by the entire hybrid arc.
    `RESEARCH_FINDINGS.md` compounds it by writing "our mma.sync.m16n8k16 / m16n8k64-for-NVFP4 is
@@ -977,11 +977,11 @@ Recorded because a new engineer will hit these:
 11. **`README.md` compares against "vLLM / SGLang"** throughout, but **no SGLang measurement exists
     anywhere in the repo** — SGLang appears only as a source of borrowed techniques (constitution §6:
     `BLOCK_SIZE_M=16`, single-CTA `moe_align`, the 1.78×-at-bs=1 MoE claim).
-12. **`SERVER_PLAN.md`'s tokenizer spec** describes the old `<start_of_turn>` Gemma template; the
+12. **`../dev/archive/SERVER_PLAN.md`'s tokenizer spec** describes the old `<start_of_turn>` Gemma template; the
     shipped tokenizer uses gemma-4's `<|turn>`/`<turn|>`. The plan was not updated after the fix.
 13. **Roofline**: five different ceilings across the docs (190 / 152 / 137 / 94 / 78). The 78 figure
     in `RESEARCH_FINDINGS.md` §3 is the corrected one and supersedes the rest.
-14. **`STATUS.md` is the oldest doc in the tree** (2026-06-30) and describes Thor as "GB10,
+14. **`../dev/archive/STATUS.md` is the oldest doc in the tree** (2026-06-30) and describes Thor as "GB10,
     sm_120/121" and lists Phase 3.6 (DFlash) and 3.8 (server) as **not done**. Both are done. It also
     records the pre-hybrid vLLM trace results (mean τ 4.61, avg decode 41.7 tok/s) which are the
     `traces/` numbers, not comparable to the later 107.5 benchmark.
@@ -991,7 +991,7 @@ Recorded because a new engineer will hit these:
 ## 12. Twenty-minute orientation for a new engineer
 
 1. Read `CUDA_ENGINEERING_CONSTITUTION.md` §0–§5 and §8. It is the only current state document.
-   Ignore `CHAMPION.md`; treat `OPTIMIZATION_LOG.md` and `STATUS.md` as the parent repo's history.
+   Ignore `../dev/archive/CHAMPION.md`; treat `../dev/archive/OPTIMIZATION_LOG.md` and `../dev/archive/STATUS.md` as the parent repo's history.
 2. Read `reference/MODELING_NOTES.md` before touching any target kernel — the four things people get
    wrong on gemma-4 are: plain-`weight` RMSNorm (no `1+`), `scaling=1.0` attention, `k_eq_v` on the
    5 full layers, and the dense-MLP-in-parallel-with-MoE block with two different pre-norms.
